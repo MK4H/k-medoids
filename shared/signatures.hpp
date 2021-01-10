@@ -101,7 +101,7 @@ public:
 	 * \brief Alias for getRawData().
 	 */
 	const NUM_TYPE* getWeights() const		{ return getRawData(); }
-	
+
 	/**
 	 * \brief Return pointer to selected centroid coordinates.
 	 * \param i Index of the centroid (from 0 to length-1).
@@ -130,7 +130,7 @@ template<int DIM, typename NUM_TYPE = float> class DBSignatureList
 protected:
 	const NUM_TYPE *mData;	///< Pointer to a block, where raw data are stored.
 
-	/** 
+	/**
 	 * \brief Index over the data. It holds prefix scan of signature lengths.
 	 * \note The lengts are in fact numbers of centroids.
 	 */
@@ -163,6 +163,51 @@ public:
 	 */
 	std::size_t size() const { return mCount; }
 
+	/**
+	 * \brief Return number of centroits in subset
+	 * \param begin Index of the first signature in the subset
+	 * \param end Index of the first signature after the subset
+	 */
+	std::size_t subsetNumCentroids(std::size_t begin, std::size_t end) const {
+		assert(begin >= 0);
+		assert(end <= mCount);
+		assert(begin <= end);
+		auto beginIndex = (begin > 0) ? mIndex[begin - 1] : 0;
+		auto endIndex = (end > 0) ? mIndex[end - 1] : 0;
+		return endIndex - beginIndex;
+	}
+
+	void copySubsetTo(std::size_t begin, std::size_t end, db_offset_t *indexes, NUM_TYPE *data) const {
+		assert(begin >= 0);
+		assert(end <= mCount);
+		assert(begin <= end);
+		assert(indexes != nullptr);
+		assert(data != nullptr);
+
+		// TODO: Can be done in parallel, both the for loop and both tasks
+		auto baseIndex = (begin > 0) ? mIndex[begin - 1] : 0;
+		// -1 for subtracts the leading zero element
+		for (auto i = 0; i < end - begin - 1; ++i) {
+			indexes[i] = mIndex[begin + i + 1] - baseIndex;
+		}
+
+		auto mDataBegin = mData + baseIndex * (DIM + 1);
+		auto mDataEnd = mData + (end > 0) ? mIndex[end - 1] : 0;
+		std::copy(mDataBegin, mDataEnd, data);
+	}
+
+	std::size_t dataSize() const { return mIndex[mCount - 1] * (DIM + 1); }
+	const NUM_TYPE *data() const { return mData; }
+	const db_offset_t *indexData() const { return mIndex; }
+
+	NUM_TYPE signatureDataStart(std::size_t i) const {
+		db_offset_t offset = (i > 0) ? mIndex[i-1] : 0;
+		return mData + offset*(DIM+1);
+	}
+
+	NUM_TYPE signatureDataEnd(std::size_t i) const {
+		return mData + mIndex[i]*(DIM+1);
+	}
 
 	/**
 	 * \brief Fetch selected signature.
@@ -173,7 +218,7 @@ public:
 	{
 		assert(i < mCount);
 		db_offset_t offset = (i > 0) ? mIndex[i-1] : 0;
-		return DBSignature<DIM, NUM_TYPE>(mData + offset*(DIM+1), static_cast<std::size_t>(mIndex[i]-offset), i);
+		return DBSignature<DIM, NUM_TYPE>(signatureDataStart(i), static_cast<std::size_t>(mIndex[i]-offset), i);
 	}
 
 
@@ -186,6 +231,8 @@ public:
 	 * \brief Return the number of centroids of the largest signature in the list.
 	 */
 	std::size_t getMaxSignatureLength() const { return mMaxSignatureLength; }
+
+
 
 
 	/**
@@ -276,7 +323,7 @@ public:
 		file.open(fileName, std::ios_base::in);
 		if (file.fail())
 			throw DBException("Cannot open database file.");
-		
+
 		// Read the file contents into raw vectors.
 		std::string buf;
 		while (!file.eof() && !file.fail()) {
@@ -346,7 +393,7 @@ public:
 		// The pointers must be updates since the vectors may have relocated.
 		this->mData = &(mDataVec[0]);
 		this->mIndex = &(mIndexVec[0]);
-		
+
 		++this->mCount;
 	}
 };
@@ -549,7 +596,7 @@ private:
 
 
 	/**
-	 * \brief Finalize and close the file. 
+	 * \brief Finalize and close the file.
 	 */
 	void close()
 	{
@@ -561,7 +608,7 @@ private:
 		std::fseek(mFp, 0, SEEK_SET);	// Seek back to file beginning.
 		if (std::fwrite(&mHeader, sizeof(DBFileDescriptor), 1, mFp) != 1)
 			throw DBException("Cannot save db file descriptor into a file.");
-		
+
 		// Write the database index.
 		if (std::fwrite(&(mIndex[0]), sizeof(db_offset_t), mIndex.size(), mFp) != mIndex.size())
 			throw DBException("Cannot save index into a file.");
@@ -703,7 +750,7 @@ public:
 
 
 	/**
-	 * \brief Finalize and close the file. 
+	 * \brief Finalize and close the file.
 	 */
 	void close()
 	{
