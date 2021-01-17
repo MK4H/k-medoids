@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <type_traits>
+#include <limits>
 
 #include "kernels.cuh"
 #include "helpers.hpp"
@@ -56,8 +57,8 @@ public:
 
         // NOTE: We could have separate sigPerBlock for Assignment kernels and Scores kernels, but this might be enough
         auto maxSigPerBlock = std::max(
-            getMaxSigPerBlockAssignment(this->sharedMemSize, this->inputData.getMaxSignatureLength(), this->blockSize),
-            getMaxSigPerBlockScores(this->sharedMemSize, this->inputData.getMaxSignatureLength(), this->blockSize)
+            getMaxSigPerBlockAssignment<DIM, FLOAT>(this->sharedMemSize, this->inputData.getMaxSignatureLength(), this->blockSize),
+            getMaxSigPerBlockScores<DIM, FLOAT>(this->sharedMemSize, this->inputData.getMaxSignatureLength(), this->blockSize)
         );
 
         if (this->sigPerBlock > maxSigPerBlock) {
@@ -226,14 +227,16 @@ public:
     )
         : CudaAlg<DIM, FLOAT>(device, inputData, nodeDataOffset, nodeDataSize, alpha, numClusters, blockSize, sigPerBlock, blocksPerKernel, cudaStreams)
     {
-        this->numBlocks = this->inputData.size() / this->sigPerBlock + (this->inputData.size() % this->sigPerBlock != 0 ? 1 : 0);
+        this->numBlocks = this->nodeDataSize / this->sigPerBlock + (this->nodeDataSize % this->sigPerBlock != 0 ? 1 : 0);
         this->numKernels = this->numBlocks / this->blocksPerKernel + (this->numBlocks % this->blocksPerKernel != 0 ? 1 : 0);
         this->maxSigPerKernel = this->sigPerBlock * this->blocksPerKernel;
 
-        CUCH(cudaMalloc(&this->dData, nodeDataSize * this->inputData.getMaxSignatureLength() * sizeof(FLOAT)));
-        CUCH(cudaMalloc(&this->dIndexes, nodeDataSize * sizeof(db_offset_t)));
-        CUCH(cudaMalloc(&this->dMedData, numClusters * this->inputData.getMaxSignatureLength() * sizeof(FLOAT)));
-        CUCH(cudaMalloc(&this->dMedIndexes, numClusters * sizeof(db_offset_t)));
+        CUCH(cudaMalloc(&this->dData, this->inputData.dataSize() * sizeof(FLOAT)));
+        // +1 so that we can store the leading 0 to make all access consistent
+        CUCH(cudaMalloc(&this->dIndexes, (this->inputData.size() + 1) * sizeof(db_offset_t)));
+        CUCH(cudaMalloc(&this->dMedData, numClusters * this->inputData.getMaxSignatureLength() * (DIM + 1) * sizeof(FLOAT)));
+        // +1 so that we can store the leading 0 to make all access consistent
+        CUCH(cudaMalloc(&this->dMedIndexes, (numClusters + 1) * sizeof(db_offset_t)));
 
         /* TODO: We can split this to node assignments and target assignments
             We only need node assignment and target assignment large enough that
@@ -256,29 +259,31 @@ public:
 
     void initialize() override {
         CUCH(cudaMemcpy(this->dData, this->inputData.data(), this->inputData.dataSize() * sizeof(FLOAT), cudaMemcpyHostToDevice));
-        CUCH(cudaMemcpy(this->dIndexes, this->inputData.indexData(), this->inputData.size() * sizeof(db_offset_t), cudaMemcpyHostToDevice));
+
+        // Set the leading 0
+        CUCH(cudaMemset(this->dIndexes, 0, sizeof(db_offset_t)));
+        CUCH(cudaMemcpy(this->dIndexes + 1, this->inputData.indexData(), this->inputData.size() * sizeof(db_offset_t), cudaMemcpyHostToDevice));
     }
 
     void runAssignment(const std::vector<std::size_t> &medoids, std::vector<std::size_t> &assignments) override {
-        consolidateMedoids(medoids, this->dMedIndexes, this->dMedData, this->numClusters, this->inputData.getMaxSignatureLength());
-
-        auto numBlocks = this->nodeDataSize / this->sigPerBlock + (this->nodeDataSize % this->sigPerBlock != 0 ? 1 : 0);
-        auto numKernels = numBlocks / this->blocksPerKernel + (numBlocks % this->blocksPerKernel != 0 ? 1 : 0);
-        auto maxSigPerKernel = this->sigPerBlock * this->blocksPerKernel;
+        consolidateMedoids(medoids);
 
         auto sigToProcess = this->nodeDataSize;
-        for (std::size_t kernelID = 0; kernelID < numKernels; ++kernelID, sigToProcess -= maxSigPerKernel) {
-            auto kernelSig = std::min(sigToProcess, maxSigPerKernel);
+        for (std::size_t kernelID = 0; kernelID < this->numKernels; ++kernelID, sigToProcess -= this->maxSigPerKernel) {
+            auto kernelSig = std::min(sigToProcess, this->maxSigPerKernel);
             auto stream = this->streams[kernelID % this->streams.size()];
 
             auto kernelBlocks = std::min(
                 this->blocksPerKernel,
                 (kernelSig / this->sigPerBlock) + (kernelSig % this->sigPerBlock != 0 ? 1 : 0)
             );
-            auto kerDAssignments = this->dAssignments + kernelID * maxSigPerKernel;
+            auto kerDAssignments = this->dAssignments + kernelID * this->maxSigPerKernel;
+
+            db_offset_t *kerDIndexes = this->dIndexes + this->nodeDataOffset + kernelID * this->maxSigPerKernel;
+            FLOAT * kerDData = this->dData + this->inputData.signatureDataStartOffset(this->nodeDataOffset + kernelID * this->maxSigPerKernel) * (DIM + 1);
             runComputeAssignmentsConsolidated<DIM, FLOAT>(
-                this->dNIndexes + kernelID * maxSigPerKernel,
-                this->dNData + this->inputData.indexData()[kernelID * maxSigPerKernel] * (DIM + 1),
+                kerDIndexes,
+                kerDData,
                 kernelSig,
                 this->dMedIndexes,
                 this->dMedData,
@@ -290,7 +295,7 @@ public:
                 kernelBlocks,
                 stream
             );
-            CUCH(cudaMemcpyAsync(kerDAssignments, assignments.data() + this->nodeDataOffset + kernelID * maxSigPerKernel, kernelSig * sizeof(std::size_t), cudaMemcpyDeviceToHost, stream));
+            CUCH(cudaMemcpyAsync(assignments.data() + this->nodeDataOffset + kernelID * this->maxSigPerKernel, kerDAssignments, kernelSig * sizeof(std::size_t), cudaMemcpyDeviceToHost, stream));
         }
         CUCH(cudaDeviceSynchronize());
     }
@@ -302,30 +307,33 @@ public:
     void runScores(const std::vector<std::size_t> &assignments, std::vector<FLOAT> &scores) override {
         auto sigToProcess = this->nodeDataSize;
         // TODO: Split and overlap the copy
-        CUCH(cudaMemcpy(this->dAssignments, assignments.data(), assignments.size() * sizeof(FLOAT), cudaMemcpyHostToDevice));
-        for (std::size_t kernelID = 0; kernelID < numKernels; ++kernelID, sigToProcess -= this->maxSigPerKernel) {
+        runZeroOut<FLOAT>(this->dNScores, this->nodeDataSize, 10);
+        CUCH(cudaMemcpy(this->dAssignments, assignments.data(), assignments.size() * sizeof(std::size_t), cudaMemcpyHostToDevice));
+        for (std::size_t kernelID = 0; kernelID < this->numKernels; ++kernelID, sigToProcess -= this->maxSigPerKernel) {
             auto kernelSig = std::min(sigToProcess, this->maxSigPerKernel);
             auto stream = this->streams[kernelID % this->streams.size()];
 
+            db_offset_t *kerDIndexes = this->dIndexes + this->nodeDataOffset + kernelID * this->maxSigPerKernel;
+            FLOAT * kerDData = this->dData + this->inputData.signatureDataStartOffset(this->nodeDataOffset + kernelID * this->maxSigPerKernel) * (DIM + 1);
+            auto kerDAssignments = this->dAssignments + this->nodeDataOffset + kernelID * this->maxSigPerKernel;
             auto kerDScores = this->dNScores + kernelID * this->maxSigPerKernel;
             runGetScores<DIM, FLOAT>(
-                this->dNIndexes + kernelID * this->maxSigPerKernel,
-                this->dNData + this->inputData.indexData()[kernelID * this->maxSigPerKernel] * (DIM + 1),
-                this->dAssignments + this->nodeDataOffset + kernelID * this->maxSigPerKernel,
+                kerDIndexes,
+                kerDData,
+                kerDAssignments,
                 kernelSig,
                 this->dIndexes,
                 this->dData,
-                this->inputData.size(),
                 this->dAssignments,
+                this->inputData.size(),
                 this->alpha,
                 this->inputData.getMaxSignatureLength(),
-                kernelID,
                 kerDScores,
                 this->blockSize,
                 this->numBlocks,
                 stream
             );
-            CUCH(cudaMemcpyAsync(kerDScores, scores.data() + this->nodeDataOffset + kernelID * this->maxSigPerKernel, kernelSig * sizeof(std::size_t), cudaMemcpyDeviceToHost, stream));
+            CUCH(cudaMemcpyAsync(scores.data() + this->nodeDataOffset + kernelID * this->maxSigPerKernel, kerDScores, kernelSig * sizeof(FLOAT), cudaMemcpyDeviceToHost, stream));
         }
         CUCH(cudaDeviceSynchronize());
     }
@@ -333,7 +341,7 @@ public:
     // TODO: Try restricted modifier
     bool computeMedoids(const std::vector<std::size_t> &assignments, const std::vector<FLOAT> &scores, std::vector<std::size_t> &medoids) override {
         // TODO: Preallocate in constructor
-        std::vector<FLOAT> minScores(medoids.size());
+        std::vector<FLOAT> minScores(medoids.size(), std::numeric_limits<FLOAT>::infinity());
         std::vector<std::size_t> newMedoids(medoids.size());
         // TODO: Use OpenMP
         bool changed = false;
@@ -350,6 +358,7 @@ public:
             }
         }
 
+        medoids = std::move(newMedoids);
         return changed;
     }
 
@@ -357,10 +366,6 @@ private:
     // All data
     FLOAT *dData;
     db_offset_t *dIndexes;
-
-    // Node data
-    FLOAT *dNData;
-    db_offset_t *dNIndexes;
 
     // For consolidated medoids
     FLOAT *dMedData;
@@ -373,32 +378,27 @@ private:
     std::size_t numKernels;
     std::size_t maxSigPerKernel;
 
-    void consolidateMedoids(
-        const std::vector<std::size_t> &medoids,
-        const db_offset_t *dMedIndexes,
-        const FLOAT *dMedData,
-        const std::size_t numClusters,
-        const std::size_t maxSignatureSize
-    ) {
+    void consolidateMedoids(const std::vector<std::size_t> &medoids) {
         // TODO: Preallocate these arrays
-        std::vector<db_offset_t> medIndexes(numClusters + 1);
-        std::vector<FLOAT> medData(numClusters * maxSignatureSize * (DIM + 1));
+        std::vector<db_offset_t> medIndexes;
+        std::vector<FLOAT> medData;
+
+        medIndexes.reserve(this->numClusters + 1);
+        medData.reserve(this->numClusters * this->inputData.getMaxSignatureLength() * (DIM + 1));
 
         const FLOAT *data = this->inputData.data();
-        const db_offset_t *indexes = this->inputData.indexData();
 
-        medIndexes[0] = 0;
-        for (std::size_t i = 0; i < medoids.size(); ++i) {
-            auto medIdx = medoids[i];
-            auto medStart = medIdx != 0 ? indexes[medIdx - 1] : 0;
-            auto medEnd = indexes[medIdx];
+        medIndexes.push_back(0);
+        for (auto&& medIdx: medoids) {
+            auto medStart = this->inputData.signatureDataStartOffset(medIdx);
+            auto medEnd = this->inputData.signatureDataEndOffset(medIdx);
             auto medSize = medEnd - medStart;
             medIndexes.push_back(medIndexes.back() + medSize);
             medData.insert(medData.end(), data + medStart * (DIM + 1), data + medEnd * (DIM + 1));
         }
 
-        CUCH(cudaMemcpy(medIndexes.data(), dMedIndexes, medIndexes.size() * sizeof(std::size_t), cudaMemcpyHostToDevice));
-        CUCH(cudaMemcpy(medData.data(), dMedData, medData.size() * sizeof(FLOAT), cudaMemcpyHostToDevice));
+        CUCH(cudaMemcpy(this->dMedIndexes, medIndexes.data(), medIndexes.size() * sizeof(db_offset_t), cudaMemcpyHostToDevice));
+        CUCH(cudaMemcpy(this->dMedData, medData.data(), medData.size() * sizeof(FLOAT), cudaMemcpyHostToDevice));
     }
 
 };
@@ -406,7 +406,7 @@ private:
 template<int DIM, typename FLOAT = float>
 void work(
     int rank,
-    int num_ranks,
+    int numRanks,
     FLOAT alpha,
     std::size_t k,
     std::size_t maxIters,
@@ -428,18 +428,30 @@ void work(
     CUCH(cudaGetDeviceCount(&numDevices)); // numDevices == ranks per node
     int localRank = rank % numDevices;
 
-    std::size_t nodeDataSize = (db.size() / num_ranks) + (db.size() % num_ranks != 0 ? 1 : 0);
+    std::size_t nodeDataSize = (db.size() / numRanks) + (db.size() % numRanks != 0 ? 1 : 0);
     std::size_t nodeDataOffset = rank * nodeDataSize;
 
-    nodeDataSize = std::min(nodeDataSize, db.size() - nodeDataOffset);
+    // Last node may have a little less data
+    std::size_t lastNodeDataSize = db.size() - nodeDataSize * (numRanks - 1);
+    std::size_t curNodeDataSize = rank != numRanks - 1 ? nodeDataSize : lastNodeDataSize;
 
+    std::vector<int> recvCounts(numRanks, nodeDataSize);
+    recvCounts.back() = lastNodeDataSize;
+    std::vector<int> displacements(numRanks);
+    for (std::size_t i = 0; i < displacements.size(); ++i) {
+        displacements[i] = i * nodeDataSize;
+    }
+
+    // NOTE: Try to allocate a larger arrays nodeDataSize * numRanks
+    // so that we can use simple MPI_Allgather instead of MPI_Allgatherv
     std::vector<FLOAT> scores(db.size());
+    results.mAssignment.resize(db.size());
 
     ConsCudaAlg<DIM, FLOAT> alg{
         localRank,
         db,
         nodeDataOffset,
-        nodeDataSize,
+        curNodeDataSize,
         alpha,
         k,
         blockSize,
@@ -453,11 +465,13 @@ void work(
     for (std::size_t iter = 0; iter < maxIters; ++iter) {
         alg.runAssignment(results.mMedoids, results.mAssignment);
 
-        MPICH(MPI_Allgather(results.mAssignment.data() + nodeDataOffset, nodeDataSize, assign_mpi_type, results.mAssignment.data(), results.mAssignment.size(), assign_mpi_type, MPI_COMM_WORLD));
+        MPICH(MPI_Allgatherv(results.mAssignment.data() + nodeDataOffset, curNodeDataSize, assign_mpi_type, results.mAssignment.data(), recvCounts.data(), displacements.data(), assign_mpi_type, MPI_COMM_WORLD));
 
         alg.runScores(results.mAssignment, scores);
 
-        MPICH(MPI_Allgather(scores.data() + nodeDataOffset, nodeDataSize, score_mpi_type, scores.data(), scores.size(), score_mpi_type, MPI_COMM_WORLD));
+        MPICH(MPI_Allgatherv(scores.data() + nodeDataOffset, curNodeDataSize, score_mpi_type, scores.data(), recvCounts.data(), displacements.data(), score_mpi_type, MPI_COMM_WORLD));
+
+        print(std::cerr, scores);
 
         if (!alg.computeMedoids(results.mAssignment, scores, results.mMedoids)) {
             return;

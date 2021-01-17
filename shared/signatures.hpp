@@ -116,8 +116,30 @@ public:
 	}
 };
 
-
-
+template<int DIM, typename NUM_TYPE = float>
+std::ostream& operator <<(std::ostream &out, const DBSignature<DIM, NUM_TYPE> &sig) {
+	out << "Id: " << sig.getId() << std::endl;
+	out << "Num centroids: " << sig.getCentroidCount() << std::endl;
+	out << "Weigths: [";
+	std::string sep = "";
+	for (std::size_t i = 0; i < sig.getCentroidCount(); ++i) {
+		out << sep << sig.getWeights()[i];
+		sep = ", ";
+	}
+	out << "]" << std::endl;
+	out << "Centroids: [" << std::endl;
+	for (std::size_t cent = 0; cent < sig.getCentroidCount(); ++cent) {
+		out << "[";
+		sep = "";
+		for (std::size_t coord = 0; coord < DIM; ++coord) {
+			out << sep << sig.getCoordinates(cent)[coord];
+			sep = ", ";
+		}
+		out << "]" << std::endl;
+	}
+	out << "]" << std::endl;
+	return out;
+}
 
 
 /**
@@ -200,13 +222,20 @@ public:
 	const NUM_TYPE *data() const { return mData; }
 	const db_offset_t *indexData() const { return mIndex; }
 
-	NUM_TYPE signatureDataStart(std::size_t i) const {
-		db_offset_t offset = (i > 0) ? mIndex[i-1] : 0;
-		return mData + offset*(DIM+1);
+	db_offset_t signatureDataStartOffset(std::size_t i) const {
+		return (i > 0) ? mIndex[i-1] : 0;
 	}
 
-	NUM_TYPE signatureDataEnd(std::size_t i) const {
-		return mData + mIndex[i]*(DIM+1);
+	db_offset_t signatureDataEndOffset(std::size_t i) const {
+		return mIndex[i];
+	}
+
+	const NUM_TYPE* signatureDataStart(std::size_t i) const {
+		return mData + signatureDataStartOffset(i)*(DIM+1);
+	}
+
+	const NUM_TYPE* signatureDataEnd(std::size_t i) const {
+		return mData + signatureDataEndOffset(i)*(DIM+1);
 	}
 
 	/**

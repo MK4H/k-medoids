@@ -1,7 +1,7 @@
 CPP=mpicxx
 STD=-std=c++17
-CFLAGS=-Wextra -O3 $(STD)
-NVCCFLAGS=-ccbin $(CPP) $(STD) -gencode=arch=compute_52,code=sm_52 -gencode=arch=compute_70,code=sm_70
+CFLAGS=-Wextra -g $(STD)
+NVCCFLAGS=-ccbin $(CPP) $(STD) -gencode=arch=compute_52,code=sm_52 -gencode=arch=compute_70,code=sm_70 -G -Xcompiler -rdynamic -lineinfo
 INCLUDE=/usr/local/cuda/include /mnt/home/_teaching/bpplib/include ./headers ../shared
 LDFLAGS=
 LIBS=

@@ -3,25 +3,25 @@
 
 #include "commons.hpp"
 
-template<typename FLOAT = float>
+template<int DIM, typename FLOAT = float>
 std::size_t getShMemSizeAssignment(std::size_t maxSignatureSize, int blockSize, std::size_t sigPerBlock) {
-    return sizeof(FLOAT) * maxSignatureSize +
+    return sizeof(FLOAT) * maxSignatureSize * (DIM + 1) +
         sizeof(FLOAT) * sigPerBlock +
         sizeof(FLOAT) * blockSize +
         sizeof(FLOAT) * sigPerBlock +
         sizeof(db_offset_t) * (sigPerBlock + 1) +
-        sizeof(FLOAT) * maxSignatureSize * sigPerBlock;
+        sizeof(FLOAT) * maxSignatureSize * sigPerBlock * (DIM + 1);
 }
 
-template<typename FLOAT = float>
+template<int DIM, typename FLOAT = float>
 std::size_t getMaxSigPerBlockAssignment(std::size_t shMemSize, std::size_t maxSignatureSize, int blockSize) {
     return (
         shMemSize -
-        sizeof(FLOAT) * maxSignatureSize -
+        sizeof(FLOAT) * maxSignatureSize * (DIM + 1) -
         sizeof(FLOAT) * blockSize -
         sizeof(db_offset_t)
     ) / (
-        sizeof(FLOAT) + sizeof(FLOAT) + sizeof(db_offset_t) + sizeof(FLOAT) * maxSignatureSize
+        sizeof(FLOAT) + sizeof(FLOAT) + sizeof(db_offset_t) + sizeof(FLOAT) * maxSignatureSize * (DIM + 1)
     );
 }
 
@@ -41,24 +41,27 @@ void runComputeAssignmentsConsolidated(
     cudaStream_t stream
 );
 
-template<typename FLOAT = float>
+template<int DIM, typename FLOAT = float>
 std::size_t getShMemSizeScores(std::size_t maxSignatureSize, int blockSize, std::size_t sigPerBlock) {
-    return sizeof(FLOAT) * maxSignatureSize +
+    return sizeof(FLOAT) * maxSignatureSize * (DIM + 1) +
         sizeof(FLOAT) * sigPerBlock +
         sizeof(FLOAT) * blockSize +
+        sizeof(std::size_t) * sigPerBlock +
         sizeof(db_offset_t) * (sigPerBlock + 1) +
-        sizeof(FLOAT) * maxSignatureSize * sigPerBlock;
+        sizeof(FLOAT) * maxSignatureSize * sigPerBlock * (DIM + 1) +
+        sizeof(bool);
 }
 
-template<typename FLOAT = float>
+template<int DIM, typename FLOAT = float>
 std::size_t getMaxSigPerBlockScores(std::size_t shMemSize, std::size_t maxSignatureSize, int blockSize) {
     return (
         shMemSize -
-        sizeof(FLOAT) * maxSignatureSize -
+        sizeof(FLOAT) * maxSignatureSize * (DIM + 1) -
         sizeof(FLOAT) * blockSize -
-        sizeof(db_offset_t)
+        sizeof(db_offset_t) -
+        sizeof(bool)
     ) / (
-        sizeof(FLOAT) + sizeof(db_offset_t) + sizeof(FLOAT) * maxSignatureSize
+        sizeof(FLOAT) + sizeof(std::size_t) + sizeof(db_offset_t) + sizeof(FLOAT) * maxSignatureSize * (DIM + 1)
     );
 }
 
@@ -70,14 +73,17 @@ void runGetScores(
     const std::size_t sNumSig,
     const db_offset_t *tIndexes,
     const FLOAT *tData,
-    const std::size_t tNumSig,
     const std::size_t * tAssignments,
+    const std::size_t tNumSig,
     const FLOAT alpha,
     const std::size_t maxSignatureSize,
-    const std::size_t kernelID,
     FLOAT *sScores,
     int blockSize,
     int numBlocks,
     cudaStream_t stream
 );
+
+template<typename T>
+void runZeroOut(T *data, std::size_t size, std::size_t itemsPerThread, cudaStream_t stream = (cudaStream_t)0);
+
 #endif

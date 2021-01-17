@@ -35,8 +35,15 @@ void printResultStats(const KMedoidsResults& results)
 	for (std::size_t i = 0; i < results.mMedoids.size(); ++i) {
 		std::cout << results.mMedoids[i] << " (" << sizes[i] << "), ";
 	}
-	std::cout << std::endl;
+	std::cout << std::endl << std::endl;
+
+	for (auto&& a : results.mAssignment) {
+		std::cout << a << ", ";
+	}
+	std::cout << std::endl << std::endl;
 }
+
+
 
 template<int DIM, typename FLOAT = float>
 void run(const bpp::ProgramArguments& args, int rank, int comm_size)
@@ -51,7 +58,6 @@ void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 	std::size_t sigPerBlock = (std::size_t)args.getArgInt("sigPerBlock").getValue();
 	std::size_t blocksPerKernel = (std::size_t)args.getArgInt("blocksPerKernel").getValue();
 	std::size_t streams = (std::size_t)args.getArgInt("cudaStreams").getValue();
-
 
 	std::cout << "Opening database file " << args[0] << " ... ";
 	db_t db(args[0]);
@@ -72,21 +78,27 @@ void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 	}
 
 	results.mMedoids.resize(k);
+
+	// DEBUG
+	std::sort(results.mMedoids.begin(), results.mMedoids.end());
+	// END DEBUG
 	// Broadcast the initial medoids
 	MPICH(MPI_Bcast(results.mMedoids.data(), k, MPI_UINT64_T, 0, MPI_COMM_WORLD));
 
 	work(rank, comm_size, alpha, k, maxIters, limit, blockSize, sigPerBlock, blocksPerKernel, streams, db, results);
 
+
 	//std::cout << "Computed avg. distance: " << kMedoids.getLastAvgDistance() << std::endl;
 	//std::cout << "Computed avg. in-cluster distance: " << kMedoids.getLastAvgClusterDistance() << std::endl;
-
 	printResultStats(results);
 
-	if (args.getArg("save").isPresent()) {
+	// Save only on master
+	if (rank == 0 && args.getArg("save").isPresent()) {
 		std::string fileName = args.getArgString("save").getValue();
 		std::cout << "Saving results in " << fileName << " ..." << std::endl;
 		results.save(fileName);
 	}
+
 }
 
 int main(int argc, char* argv[])
@@ -94,6 +106,13 @@ int main(int argc, char* argv[])
 	int ret = 0;
 	int provided;
 	MPICH(MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided));
+
+	int rank, size;
+	MPICH(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+	MPICH(MPI_Comm_size(MPI_COMM_WORLD, &size));
+
+	fdRedirecter redirect(std::string("rank") + std::to_string(rank));
+
 	/*
 	 * Arguments
 	 */
@@ -112,7 +131,7 @@ int main(int argc, char* argv[])
 		// TODO: Calculate max number of signatures
 		args.registerArg<bpp::ProgramArguments::ArgInt>("sigPerBlock", "Number of signatures processed by a single block, must fit into shared memory", false, 10, 1, 64);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("blocksPerKernel", "Number of blocks per kernel, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("cudaStreams", "Number of cuda streams, determines maximum parallelism in GPU.", false, 4, 1, std::numeric_limits<bpp::ProgramArguments::ArgInt::value_t>::max());
+		args.registerArg<bpp::ProgramArguments::ArgInt>("cudaStreams", "Number of cuda streams, determines maximum parallelism in GPU.", false, 4, 1);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("seed", "Seed for random generator (to make results deterministic)", false, 42);
 
 		// Process the arguments ...
@@ -126,10 +145,6 @@ int main(int argc, char* argv[])
 	}
 
 	try {
-		int rank, size;
-		MPICH(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
-		MPICH(MPI_Comm_size(MPI_COMM_WORLD, &size));
-
 		run<7>(args, rank, size);
 	}
 	catch (std::exception& e) {

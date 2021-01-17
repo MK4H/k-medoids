@@ -1,7 +1,7 @@
 CPP=g++
 STD=-std=c++17
 CFLAGS=-Wall -O3 $(STD)
-INCLUDE=../shared ../bpplib/include
+INCLUDE=../shared /mnt/home/_teaching/bpplib/include
 LDFLAGS=
 LIBS=
 LIBDIRS=/usr/local/cuda/lib64

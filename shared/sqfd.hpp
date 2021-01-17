@@ -121,8 +121,8 @@ public:
 		// The query normalization is done just once.
 		normalize(query.getWeights(), query.getCentroidCount(), mQueryWeights);
 		mQuerySimilarity = selfSimilarity(query, alpha);
-	} 
-	
+	}
+
 
 	/**
 	 * \brief Main function of the functor.
@@ -164,7 +164,7 @@ public:
 		return (res > 0.000001) ? (NUM_TYPE)std::sqrt(res) : 0.0f;
 	}
 
-	
+
 	/**
 	 * \brief Main function of the functor.
 	 * \param sig The object signature for which the distance (from query) is computed.
@@ -191,7 +191,7 @@ public:
 		return (res > 0.000001) ? (NUM_TYPE)std::sqrt(res) : 0.0f;
 	}
 
-	
+
 	/**
 	 * \brief Compute self-similarity value of given signature.
 	 * \param sig DB signature for which the self-similarity value is computed.
@@ -231,12 +231,12 @@ public:
 	using sqfd_t = DistanceFunctorSQFD<DIM, NUM_TYPE, IN_TYPE, LP>;
 
 private:
-	const DBSignature<DIM, NUM_TYPE> *mQuery;	///< Pointer to last query object.
+	const NUM_TYPE *mQueryRawData;				///< Pointer to raw data for last query object.
 	IN_TYPE mAlpha;								///< Alpha parameter for the similarity function.
 	std::unique_ptr<sqfd_t> mFnc;				///< Cache for last created SQFD functor.
 
 public:
-	BinaryDistanceFunctorSQFD(IN_TYPE alpha) : mQuery(nullptr), mAlpha(alpha) {}
+	BinaryDistanceFunctorSQFD(IN_TYPE alpha) : mQueryRawData(nullptr), mAlpha(alpha) {}
 
 	/**
 	 * \brief Main function of the functor.
@@ -246,8 +246,8 @@ public:
 	 */
 	NUM_TYPE operator()(const DBSignature<DIM, NUM_TYPE>& querySig, const DBSignature<DIM, NUM_TYPE>& objSig)
 	{
-		if (mQuery != &querySig) {
-			mQuery = &querySig;
+		if (mQueryRawData != querySig.getRawData()) {
+			mQueryRawData = querySig.getRawData();
 			mFnc = std::make_unique<sqfd_t>(querySig, mAlpha);
 		}
 
