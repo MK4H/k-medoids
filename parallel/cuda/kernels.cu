@@ -174,7 +174,7 @@ __device__ void normalizeWeights(Signature<DIM, FLOAT> sig, FLOAT *shSums) {
 }
 
 template<int DIM, typename FLOAT = float>
-__device__ void copySigData(const db_offset_t *inIdx, const FLOAT *inAllData, int numSig, db_offset_t baseIndex, FLOAT *outData) {
+__device__ std::size_t copySigData(const db_offset_t *inIdx, const FLOAT *inAllData, int numSig, db_offset_t baseIndex, FLOAT *outData) {
     auto startOffset = idxToOffset(getLocalIndex(inIdx[0], baseIndex), DIM);
     auto endOffset = idxToOffset(getLocalIndex(inIdx[numSig], baseIndex), DIM);
 
@@ -182,6 +182,9 @@ __device__ void copySigData(const db_offset_t *inIdx, const FLOAT *inAllData, in
     for (auto i = threadIdx.x; i < endOffset - startOffset; i += blockDim.x) {
         outData[i] = inAllData[startOffset + i];
     }
+
+    // Return size of the copied data
+    return endOffset - startOffset;
 }
 
 /**
@@ -215,26 +218,40 @@ __device__ void globalToSharedIndexes(const db_offset_t *inIdx, const int numSig
  * The FLOAT may be 4 byte float or 8 byte double, which will both work when put after db_offset_t
  *
  * The amount of shared memory needed is the sum of:
+ *  sizeof(db_offset_t) * (numDataSignaturesPerBlock + 1)           // For index table of data signatures
+ *  sizeof(std::size_t) / (numDataSignaturesPerBlock)               // For intermediate assignments
  *  sizeof(FLOAT) * maxSignatureSize * (DIM + 1)                    // For current medoid
  *  sizeof(FLOAT) * numDataSignaturesPerBlock                       // For current minimal distance to medoid of each data signature
  *  sizeof(FLOAT) * blockDim.x                                      // For partial sums during SQDF computation
  *  sizeof(FLOAT) * numDataSignaturesPerBlock                       // For precomputed selfSimilarities of each data signature
- *  sizeof(db_offset_t) * (numDataSignaturesPerBlock + 1)           // For index table of data signatures
+ *
  *  sizeof(FLOAT) * maxSignatureSize * numDataSIgnaturesPerBlock * (DIM + 1)    // For the data signatures themselfs
  */
 template<int DIM, typename FLOAT = float>
-__device__ void partitionSharedMemAssign(db_offset_t *shared, std::size_t maxSignatureSize, int sigPerBlock, FLOAT *&med, FLOAT *&mins, FLOAT *&shSums, FLOAT *&dSelfSims, db_offset_t *&shIndexes, FLOAT *&shData) {
+__device__ void partitionSharedMemAssign(
+    db_offset_t *shared,
+    std::size_t maxSignatureSize,
+    int sigPerBlock,
+    db_offset_t *&shIndexes,
+    std::size_t *&shAssignments,
+    FLOAT *&med,
+    FLOAT *&mins,
+    FLOAT *&shSums,
+    FLOAT *&dSelfSims,
+    FLOAT *&shData
+) {
     // TODO: Check for bank conflicts
     // Split up the allocated shared memory
 
     // 8 byte types
     shIndexes = shared;
 
+    shAssignments = (std::size_t*)(shIndexes + sigPerBlock + 1);
     // FLOAT (4 or 8 byte)
 
     // + 1 so that we allocate one more index space for the start index of
     // the following signature to allow us to calculate the size of the last signature
-    med = (FLOAT *)(shIndexes + sigPerBlock + 1);
+    med = (FLOAT *)(shAssignments + sigPerBlock);
     mins = med + maxSignatureSize * (DIM + 1);
     // TODO: Use warp reduce and reduce the size of shSum to one element per warp
     // We need one sum entry for each thread
@@ -270,7 +287,7 @@ __global__ void computeAssignmentsConsolidated(
     const std::size_t numMed,
     const FLOAT alpha,
     const std::size_t maxSignatureSize,
-    std::size_t * assignments
+    std::size_t * kernAssignments
 ) {
     // Must be declared using the largest type
     // All access to memory in CUDA MUST be aligned
@@ -284,8 +301,20 @@ __global__ void computeAssignmentsConsolidated(
     // SHARED MEMORY PARTITIONING
 
     db_offset_t *shIndexes;
+    std::size_t *shAssignments;
     FLOAT *med, *mins, *shSums, *dSelfSims, *shData;
-    partitionSharedMemAssign<DIM, FLOAT>(shared, maxSignatureSize, sigPerBlock, med, mins, shSums, dSelfSims, shIndexes, shData);
+    partitionSharedMemAssign<DIM, FLOAT>(
+        shared,
+        maxSignatureSize,
+        sigPerBlock,
+        shIndexes,
+        shAssignments,
+        med,
+        mins,
+        shSums,
+        dSelfSims,
+        shData
+    );
 
     // Initialize mins
     for (int i = threadIdx.x; i < sigPerBlock; i += blockDim.x) {
@@ -333,22 +362,148 @@ __global__ void computeAssignmentsConsolidated(
                 FLOAT sqfd2 = dSelfSims[i] + medSelfSim + otherSim;
                 if (sqfd2 < mins[i]) {
                     mins[i] = sqfd2;
-                    assignments[blockStartSig + i] = medIdx;
+                    shAssignments[i] = medIdx;
                 }
             }
         }
     }
+
+    for (int dataSig = threadIdx.x; dataSig < blockNumSig; dataSig += blockDim.x) {
+        kernAssignments[blockStartSig + dataSig] = shAssignments[dataSig];
+    }
+
 }
 
-// TODO: Assignments without consolidating medoids, just use that the whole data fits into memory
+/**
+ * Compute assignments without consolidating medoids, take advantage of the fact that the whole data fits into memory
+ */
+template<int DIM, typename FLOAT = float>
+__global__ void computeAssignments(
+    const db_offset_t *kernIndexes,
+    const FLOAT *kernData,
+    const std::size_t kernNumSig,
+    const db_offset_t *allIndexes,
+    const FLOAT *allData,
+    const std::size_t allNumSig,
+    const std::size_t *medSeqIdxs,
+    const std::size_t numMed,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    std::size_t * kernAssignments
+) {
+    // Must be declared using the largest type
+    // All access to memory in CUDA MUST be aligned
+    // So accessing 4 byte type must be aligned to 4 bytes
+    extern __shared__  db_offset_t shared[];
+
+    // Number of blocks will always divide the number of Signatures without remainder
+    // APART from the last kernel call, which will just have to compute the rest of the data
+    const int sigPerBlock = (kernNumSig / gridDim.x) + (kernNumSig % gridDim.x != 0 ? 1 : 0);
+
+    // SHARED MEMORY PARTITIONING
+
+    db_offset_t *shIndexes;
+    std::size_t *shAssignments;
+    FLOAT *med, *mins, *shSums, *dSelfSims, *shData;
+    partitionSharedMemAssign<DIM, FLOAT>(
+        shared,
+        maxSignatureSize,
+        sigPerBlock,
+        shIndexes,
+        shAssignments,
+        med,
+        mins,
+        shSums,
+        dSelfSims,
+        shData
+    );
+
+    // Initialize mins
+    for (int i = threadIdx.x; i < sigPerBlock; i += blockDim.x) {
+        mins[i] = CUDART_INF_F;
+    }
+
+    int blockStartSig = blockIdx.x * sigPerBlock;
+    // As the processed signatures have to fit into shared memory, int is enough
+    int blockEndSig = min(blockStartSig + sigPerBlock, (int)kernNumSig);
+    int blockNumSig = blockEndSig - blockStartSig;
+
+
+    const db_offset_t dataBaseIndex = kernIndexes[0];
+    copySigData<DIM, FLOAT>(kernIndexes + blockStartSig, kernData, blockNumSig, dataBaseIndex, shData);
+    globalToSharedIndexes(kernIndexes + blockStartSig, blockNumSig, dataBaseIndex, shIndexes);
+
+    __syncthreads();
+    for (unsigned int dataSig = 0; dataSig < blockNumSig; ++dataSig) {
+        normalizeWeights<DIM, FLOAT, true>(Signature<DIM, FLOAT>(shIndexes[dataSig], shIndexes[dataSig + 1], shData), shSums);
+    }
+
+    for (int dataSig = 0; dataSig < blockNumSig; ++dataSig) {
+        FLOAT selfSim = getSelfSim(Signature<DIM, FLOAT>(shIndexes[dataSig], shIndexes[dataSig + 1], shData), alpha, shSums);
+        if (threadIdx.x == 0) {
+            dSelfSims[dataSig] = selfSim;
+        }
+    }
+
+    for (int medIdx = 0; medIdx < numMed; ++medIdx) {
+        // Load medoid to shared mem
+        // Reading from all so the base index is 0
+        // THE ONLY THING DIFFERENT FROM CONSOLIDATED
+        auto medSeqId = medSeqIdxs[medIdx];
+        copySigData<DIM, FLOAT>(allIndexes + medSeqId, allData, 1, 0, med);
+        auto medSig = Signature<DIM, FLOAT>(0, allIndexes[medSeqId + 1] - allIndexes[medSeqId], med);
+
+        __syncthreads();
+
+        normalizeWeights<DIM, FLOAT, true>(medSig, shSums);
+
+        FLOAT medSelfSim = getSelfSim(medSig, alpha, shSums);
+
+        for (int i = 0; i < blockNumSig; ++i) {
+
+            auto otherSim = getOtherSim(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), medSig, alpha, shSums);
+            if (threadIdx.x == 0) {
+                FLOAT sqfd2 = dSelfSims[i] + medSelfSim + otherSim;
+                if (sqfd2 < mins[i]) {
+                    mins[i] = sqfd2;
+                    shAssignments[i] = medIdx;
+                }
+            }
+        }
+    }
+
+    __syncthreads();
+
+    for (int dataSig = threadIdx.x; dataSig < blockNumSig; dataSig += blockDim.x) {
+        kernAssignments[blockStartSig + dataSig] = shAssignments[dataSig];
+    }
+}
 
 template<int DIM, typename FLOAT = float>
-__global__ void computeAssignments(const db_offset_t *indexes, const FLOAT *data, const std::size_t totNumSig,const db_offset_t *kernIndexes, const FLOAT *kernData, const std::size_t kernNumSig, const std::size_t *medSeqIdxs, const std::size_t numMed, const FLOAT alpha, std::size_t * assignments) {
-
-}
-
-__device__ void partitionSharedMemScore() {
-
+__device__ void partitionSharedMemScore(
+    db_offset_t *shared,
+    std::size_t maxSignatureSize,
+    int sSigPerBlock,
+    db_offset_t *&shsIndexes,
+    std::size_t *&shsAssignments,
+    FLOAT *&shsData,
+    FLOAT *&shtSig,
+    FLOAT *&shSums,
+    FLOAT *&shsSelfSims,
+    bool *&sAnyMatch
+) {
+    // TODO: Check for bank conflicts
+    // 8 byte types
+    shsIndexes = shared;
+    shsAssignments = (std::size_t *)(shsIndexes + sSigPerBlock + 1);
+    // FLOAT (4 or 8 bytes)
+    // + 1 so that we allocate one more index space for the start index of
+    // the following signature to allow us to calculate the size of the last signature
+    shsData = (FLOAT *)(shsAssignments + sSigPerBlock);
+    shtSig = shsData + sSigPerBlock * maxSignatureSize * (DIM + 1);
+    shSums = shtSig + maxSignatureSize * (DIM + 1);
+    shsSelfSims = shSums + blockDim.x;
+    sAnyMatch = (bool *)(shsSelfSims + sSigPerBlock);
 }
 
 /**
@@ -379,21 +534,12 @@ __global__ void getScores(
     // APART from the last kernel call, which will just have to compute the rest of the data
     const int sSigPerBlock = (sNumSig / gridDim.x) + (sNumSig % gridDim.x != 0 ? 1 : 0);
 
-    // TODO: Check for bank conflicts
-    // 8 byte types
-    db_offset_t *shsIndexes = shared;
-    std::size_t *shsAssignments = (std::size_t *)(shsIndexes + sSigPerBlock + 1);
-    // FLOAT (4 or 8 bytes)
-    // + 1 so that we allocate one more index space for the start index of
-    // the following signature to allow us to calculate the size of the last signature
-    FLOAT *shsData = (FLOAT *)(shsAssignments + sSigPerBlock);
-    FLOAT *shtSig = shsData + sSigPerBlock * maxSignatureSize * (DIM + 1);
-    FLOAT *shSums = shtSig + maxSignatureSize * (DIM + 1);
-    FLOAT *shsSelfSims = shSums + blockDim.x;
-    bool *sAnyMatch = (bool *)(shsSelfSims + sSigPerBlock);
+    db_offset_t *shsIndexes;
+    std::size_t *shsAssignments;
+    FLOAT *shsData, *shtSig, *shSums, *shsSelfSims;
+    bool *sAnyMatch;
+    partitionSharedMemScore<DIM, FLOAT>(shared, maxSignatureSize, sSigPerBlock, shsIndexes, shsAssignments, shsData, shtSig, shSums, shsSelfSims, sAnyMatch);
 
-
-    // TODO: Off by one errors
     int blockStartSig = blockIdx.x * sSigPerBlock;
     int blockEndSig = min((blockIdx.x + 1) * sSigPerBlock, (int)sNumSig);
     int blockNumSig = blockEndSig - blockStartSig;
@@ -421,7 +567,7 @@ __global__ void getScores(
 
     for (int tSigIdx = 0; tSigIdx < tNumSig; ++tSigIdx) {
         auto tAssignment = tAssignments[tSigIdx];
-        /*
+
         // Done just by the first warp, so that we can use warp level primitives
         if (threadIdx.x < 32) {
             bool clusterMatch = false;
@@ -439,7 +585,7 @@ __global__ void getScores(
             // No source signature is in the same cluster as target signature
             continue;
         }
-        */
+
         // TODO: Fix the 0 if we want to process anything but the whole dataset as tSig
         copySigData<DIM, FLOAT>(tIndexes + tSigIdx, tData, 1, 0, shtSig);
         auto tSig = Signature<DIM, FLOAT>(0, tIndexes[tSigIdx + 1] - tIndexes[tSigIdx], shtSig);
@@ -467,6 +613,274 @@ __global__ void getScores(
     }
 }
 
+/**
+ * Calculate partial scores of signatures from a single cluster.
+ * This function is designed so that we can split computation of
+ * scores for signatures from large clusters into multiple parallel
+ * computations.
+ *
+ * This is an n^2 problem, where we need to compute distance for every pair of source image
+ * and target image. This lends itself nicely to using two dimensional kernel.
+ *
+ * Each block of this kernel loads different block of source signatures, based on its
+ * blockId in x axis, and processes different block of target signatures based on its blockId in y axis
+ *
+ * \param indexes Index of the whole image database
+ * \param data Image database data
+ * \param assignment Cluster assignment of each image
+ * \param clusterList List of image indexes, based on their assigned cluster in increasing order.
+ *       First there are all images from cluster 0, then all from cluster 1, etc.
+ * \param clusterListIndex Index of clusterList, where clusterList[clusterListIndex[i] is the
+ *      first image of the cluster i
+ * \param sourceStartIndex Index in the clusterList where the range of source images starts for this kernel
+ * \param numSource Number of source images to process by this kernel
+ * \param targetStartIndex Index in the clusterList where the range of target images starts for this kernel
+ * \param numTargets Number of targets to process by this kernel
+ * \param alpha
+ * \param maxSignatureSize
+ * \param sScores Source image scores which will be added to by this kernel
+ *
+ * We load the source signatures into shared memory, and then go through the target signatures one by one,
+ * computing score of each source signature. After we go through the whole target range,
+ * we add the score of each source signature atomically to the score in sScores.
+ * This is to allow other kernels to compute partial scores for the same source nodes,
+ * but with different target range, all in parallel.
+ */
+template<int DIM, typename FLOAT = float>
+__global__ void getScoresPreprocessedLarge(
+    const db_offset_t *indexes,
+    const FLOAT *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t sourceStartIndex,
+    const std::size_t numSources,
+    const std::size_t targetStartIndex,
+    const std::size_t numTargets,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    FLOAT *sScores) {
+
+    // Must be declared using the largest type
+    // All access to memory in CUDA MUST be aligned
+    // So accessing 4 byte type must be aligned to 4 bytes
+    extern __shared__  db_offset_t shared[];
+
+    const int sourcesPerBlock = (numSources / gridDim.x) + (numSources % gridDim.x != 0 ? 1 : 0);
+    const int targetsPerBlock = (numTargets / gridDim.y) + (numTargets % gridDim.y != 0 ? 1 : 0);
+
+    db_offset_t *shIndexes;
+    FLOAT *shData, *shtData, *shSums, *shSelfSims, *shScores;
+
+    // TODO: Check for bank conflicts
+    // 8 byte types
+    shIndexes = shared;
+
+    // FLOAT (4 or 8 bytes)
+    // + 1 so that we allocate one more index space for the start index of
+    // the following signature to allow us to calculate the size of the last signature
+    shData = (FLOAT *)(shIndexes + sourcesPerBlock + 1);
+    shtData = shData + sourcesPerBlock * maxSignatureSize * (DIM + 1);
+    shSums = shtData + maxSignatureSize * (DIM + 1);
+    shSelfSims = shSums + blockDim.x;
+    shScores = shSelfSims + sourcesPerBlock;
+
+    int blockStartSource = sourceStartIndex + blockIdx.x * sourcesPerBlock;
+    int blockEndSource = min(blockStartSource + sourcesPerBlock, (int)(sourceStartIndex + numSources));
+    int blockNumSource = blockEndSource - blockStartSource;
+
+    // Copy non-continuous signatures belonging to the same cluster into continuous shared memory
+    auto cshData = shData;
+    shIndexes[0] = 0;
+    for (int i = 0; i < blockNumSource; ++i) {
+        auto sigId = clusterList[sourceStartIndex + i];
+        auto cpSize = copySigData<DIM, FLOAT>(indexes + sigId, data, 1, 0, shData);
+        cshData += cpSize;
+        if (threadIdx.x == 0) {
+            shIndexes[i + 1] = shIndexes[i] + cpSize;
+        }
+    }
+
+    __syncthreads();
+    for (unsigned int i = 0; i < blockNumSource; ++i) {
+        normalizeWeights<DIM, FLOAT, true>(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), shSums);
+    }
+
+    for (unsigned int i = 0; i < blockNumSource; ++i) {
+        FLOAT selfSim = getSelfSim(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), alpha, shSums);
+        if (threadIdx.x == 0) {
+            shSelfSims[i] = selfSim;
+        }
+    }
+
+
+    int blockStartTarget = targetStartIndex + blockIdx.y * targetsPerBlock;
+    int blockEndTarget = min(blockStartTarget + targetsPerBlock, (int)(targetStartIndex + numTargets));
+
+    for (unsigned int t = blockStartTarget; t < blockEndTarget; ++t) {
+        const db_offset_t *tIndex = indexes + clusterList[t];
+        copySigData<DIM, FLOAT>(tIndex, data, 1, 0, shtData);
+        auto tSig = Signature<DIM, FLOAT>(0, *(tIndex + 1) - *tIndex, shtData);
+        __syncthreads();
+
+        normalizeWeights<DIM, FLOAT, true>(tSig, shSums);
+        FLOAT tSelfSim = getSelfSim(tSig, alpha, shSums);
+
+        for (unsigned int s = 0; s < blockNumSource; ++s) {
+            auto otherSim = getOtherSim(
+                Signature<DIM, FLOAT>(shIndexes[s], shIndexes[s + 1], shData),
+                tSig,
+                alpha,
+                shSums);
+
+            if (threadIdx.x == 0) {
+                shScores[s] += shSelfSims[s] + tSelfSim + otherSim;
+            }
+        }
+    }
+
+    for (unsigned int s = threadIdx.x; s < blockNumSource; s += blockDim.x) {
+        atomicAdd(sScores + sourceStartIndex + s, shScores[s]);
+    }
+}
+
+/**
+ * Calculate scores for signatures from multiple small clusters
+ * This function expects that it is the only one
+ * computing score for each of the source signatures it processes
+ * as these are only small clusters which don't need to be split
+ *
+ * This function takes sourcesPerBlock signatures starting from clusterList at startIndex.
+ * clusterList contains image sequential ids ordered according to the cluster they belong to.
+ * So first are all images from cluster 0, then all from cluster 1, then all from cluster 2 etc.
+ * clusterListIndex[i] tells us index in clusterList where cluster i starts
+ *
+ * We load the source signatures to shared memory in order of increasing cluster number
+ * Then we get the cluster number of the first source signature and we go through
+ * the whole cluster in clusterList, computing distances of all source signatures from
+ * this cluster to all targets in the cluster.
+ *
+ * Once we go through all the targets in the first cluster, we get to the second cluster,
+ * and we start computing distances of all source signatures from the second cluster
+ * to all targets in the second cluster.
+ *
+ * We go like this through all the clusters the source signatures are from.
+ * As we compute the whole score for each source signature, we expect that we are
+ * the only ones writing to the given value in sScores.
+ */
+template<int DIM, typename FLOAT = float>
+__global__ void getScoresPreprocessedSmall(
+    const db_offset_t *indexes,
+    const FLOAT *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t *clusterListIndex,
+    const std::size_t startIndex,
+    const std::size_t numSources,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    FLOAT *sScores) {
+
+    // Must be declared using the largest type
+    // All access to memory in CUDA MUST be aligned
+    // So accessing 4 byte type must be aligned to 4 bytes
+    extern __shared__  db_offset_t shared[];
+
+    const int sourcesPerBlock = (numSources / gridDim.x) + (numSources % gridDim.x != 0 ? 1 : 0);
+
+    db_offset_t *shIndexes;
+    FLOAT *shData, *shtData, *shSums, *shSelfSims, *shScores;
+
+    // TODO: Check for bank conflicts
+    // 8 byte types
+    shIndexes = shared;
+
+    // FLOAT (4 or 8 bytes)
+    // + 1 so that we allocate one more index space for the start index of
+    // the following signature to allow us to calculate the size of the last signature
+    shData = (FLOAT *)(shIndexes + sourcesPerBlock + 1);
+    shtData = shData + sourcesPerBlock * maxSignatureSize * (DIM + 1);
+    shSums = shtData + maxSignatureSize * (DIM + 1);
+    shSelfSims = shSums + blockDim.x;
+    shScores = shSelfSims + sourcesPerBlock;
+
+    // Initialize scores
+    for (int i = threadIdx.x; i < sourcesPerBlock; i += blockDim.x) {
+        shScores[i] = 0;
+    }
+
+    // TODO: These ints may be a problem for very large datasets
+    int blockStartSource = startIndex + blockIdx.x * sourcesPerBlock;
+    int blockEndSource = min(blockStartSource + sourcesPerBlock, (int)(startIndex + numSources));
+    int blockNumSource = blockEndSource - blockStartSource;
+
+    // Copy non-continuous signatures belonging to the same cluster into continuous shared memory
+    auto cshData = shData;
+    shIndexes[0] = 0;
+    for (int i = 0; i < blockNumSource; ++i) {
+        auto sigId = clusterList[blockStartSource + i];
+        auto cpSize = copySigData<DIM, FLOAT>(indexes + sigId, data, 1, 0, shData);
+        cshData += cpSize;
+        if (threadIdx.x == 0) {
+            shIndexes[i + 1] = shIndexes[i] + cpSize;
+        }
+    }
+
+    __syncthreads();
+    for (unsigned int i = 0; i < blockNumSource; ++i) {
+        normalizeWeights<DIM, FLOAT, true>(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), shSums);
+    }
+
+    for (unsigned int i = 0; i < blockNumSource; ++i) {
+        FLOAT selfSim = getSelfSim(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), alpha, shSums);
+        if (threadIdx.x == 0) {
+            shSelfSims[i] = selfSim;
+        }
+    }
+
+    auto curCluster = assignment[clusterList[blockStartSource]];
+    auto curClusterStart = clusterListIndex[curCluster];
+    auto curClusterEnd = clusterListIndex[curCluster + 1];
+    auto lastClusterEnd = clusterListIndex[assignment[blockEndSource] + 1];
+
+    auto sourceStart = 0;
+    auto sourceEnd = min((int)(curClusterEnd - blockStartSource), blockNumSource);
+    for (unsigned int t = curClusterStart; t < lastClusterEnd; ++t) {
+        const db_offset_t *tIndex = indexes + clusterList[t];
+        copySigData<DIM, FLOAT>(tIndex, data, 1, 0, shtData);
+        auto tSig = Signature<DIM, FLOAT>(0, *(tIndex + 1) - *tIndex, shtData);
+        __syncthreads();
+
+        normalizeWeights<DIM, FLOAT, true>(tSig, shSums);
+        FLOAT tSelfSim = getSelfSim(tSig, alpha, shSums);
+
+        for (unsigned int s = sourceStart; s < sourceEnd; ++s) {
+            auto otherSim = getOtherSim(
+                Signature<DIM, FLOAT>(shIndexes[s], shIndexes[s + 1], shData),
+                tSig,
+                alpha,
+                shSums);
+
+            if (threadIdx.x == 0) {
+                shScores[s] += shSelfSims[s] + tSelfSim + otherSim;
+            }
+        }
+
+        if (t == curClusterEnd) {
+            sourceStart = sourceEnd;
+            curCluster += 1;
+            curClusterEnd = clusterListIndex[curCluster + 1];
+            sourceEnd = min((int)(curClusterEnd - blockStartSource), blockNumSource);
+        }
+    }
+
+    for (unsigned int s = 0; s < blockNumSource; ++s) {
+        // This function expects that it is the only one
+        // computing score for each of the source signatures it processes
+        // as these are only small clusters which don't need to be split
+        sScores[blockStartSource + s] = shScores[s];
+    }
+}
+
 template<typename T>
 __global__ void zeroOut(T *data, std::size_t size) {
     for (std::size_t i = threadIdx.x; i < size; i += blockDim.x) {
@@ -484,7 +898,7 @@ void runComputeAssignmentsConsolidated(
     const std::size_t numMed,
     const FLOAT alpha,
     const std::size_t maxSignatureSize,
-    std::size_t * assignments,
+    std::size_t * kernAssignments,
     int blockSize,
     int numBlocks,
     cudaStream_t stream
@@ -492,7 +906,42 @@ void runComputeAssignmentsConsolidated(
     std::size_t dataSigPerBlock = (numSig / numBlocks + (numSig % numBlocks != 0 ? 1 : 0));
     std::size_t shMemSize = getShMemSizeAssignment<DIM, FLOAT>(maxSignatureSize, blockSize, dataSigPerBlock);
 
-    computeAssignmentsConsolidated<DIM, FLOAT><<<numBlocks, blockSize, shMemSize, stream>>>(indexes, data, numSig, medIndexes, medData, numMed, alpha, maxSignatureSize, assignments);
+    computeAssignmentsConsolidated<DIM, FLOAT><<<numBlocks, blockSize, shMemSize, stream>>>(indexes, data, numSig, medIndexes, medData, numMed, alpha, maxSignatureSize, kernAssignments);
+}
+
+template<int DIM, typename FLOAT>
+void runComputeAssignments(
+    const db_offset_t *kernIndexes,
+    const FLOAT *kernData,
+    const std::size_t kernNumSig,
+    const db_offset_t *allIndexes,
+    const FLOAT *allData,
+    const std::size_t allNumSig,
+    const std::size_t *medSeqIdxs,
+    const std::size_t numMed,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    std::size_t * kernAssignments,
+    int blockSize,
+    int numBlocks,
+    cudaStream_t stream
+) {
+    std::size_t dataSigPerBlock = (kernNumSig / numBlocks + (kernNumSig % numBlocks != 0 ? 1 : 0));
+    std::size_t shMemSize = getShMemSizeAssignment<DIM, FLOAT>(maxSignatureSize, blockSize, dataSigPerBlock);
+
+    computeAssignments<DIM, FLOAT><<<numBlocks, blockSize, shMemSize, stream>>>(
+        kernIndexes,
+        kernData,
+        kernNumSig,
+        allIndexes,
+        allData,
+        allNumSig,
+        medSeqIdxs,
+        numMed,
+        alpha,
+        maxSignatureSize,
+        kernAssignments
+    );
 }
 
 template<int DIM, typename FLOAT>
@@ -530,6 +979,77 @@ void runGetScores(
     );
 }
 
+template<int DIM, typename FLOAT>
+void runGetScoresPreprocessedLarge(
+    const db_offset_t *indexes,
+    const FLOAT *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t sourceStartIndex,
+    const std::size_t numSources,
+    const std::size_t targetStartIndex,
+    const std::size_t numTargets,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    FLOAT *sScores,
+    int blockSize,
+    int sourceBlocks,
+    int targetBlocks,
+    cudaStream_t stream
+) {
+
+    std::size_t sourcesPerBlock = (numSources / sourceBlocks + (numSources % sourceBlocks != 0 ? 1 : 0));
+    std::size_t shMemSize = getShMemSizeScoresPreprocessed<DIM, FLOAT>(maxSignatureSize, blockSize, sourcesPerBlock);
+
+    dim3 gridDim(sourceBlocks, targetBlocks);
+    getScoresPreprocessedLarge<DIM, FLOAT><<<gridDim, blockSize, shMemSize, stream>>>(
+        indexes,
+        data,
+        assignment,
+        clusterList,
+        sourceStartIndex,
+        numSources,
+        targetStartIndex,
+        numTargets,
+        alpha,
+        maxSignatureSize,
+        sScores
+    );
+}
+
+template<int DIM, typename FLOAT>
+void runGetScoresPreprocessedSmall(
+    const db_offset_t *indexes,
+    const FLOAT *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t *clusterListIndex,
+    const std::size_t startIndex,
+    const std::size_t numSources,
+    const FLOAT alpha,
+    const std::size_t maxSignatureSize,
+    FLOAT *sScores,
+    int blockSize,
+    int numBlocks,
+    cudaStream_t stream) {
+
+    std::size_t sSigPerBlock = (numSources / numBlocks + (numSources % numBlocks != 0 ? 1 : 0));
+    std::size_t shMemSize = getShMemSizeScoresPreprocessed<DIM, FLOAT>(maxSignatureSize, blockSize, sSigPerBlock);
+
+    getScoresPreprocessedSmall<DIM, FLOAT><<<numBlocks, blockSize, shMemSize, stream>>>(
+        indexes,
+        data,
+        assignment,
+        clusterList,
+        clusterListIndex,
+        startIndex,
+        numSources,
+        alpha,
+        maxSignatureSize,
+        sScores
+    );
+}
+
 template<typename T>
 void runZeroOut(T *data, std::size_t size, std::size_t itemsPerThread, cudaStream_t stream) {
     constexpr int threadsPerBlock = 256;
@@ -552,6 +1072,23 @@ template void runComputeAssignmentsConsolidated<7, float>(
     cudaStream_t stream
 );
 
+template void runComputeAssignments<7, float>(
+    const db_offset_t *kernIndexes,
+    const float *kernData,
+    const std::size_t kernNumSig,
+    const db_offset_t *allIndexes,
+    const float *allData,
+    const std::size_t allNumSig,
+    const std::size_t *medSeqIdxs,
+    const std::size_t numMed,
+    const float alpha,
+    const std::size_t maxSignatureSize,
+    std::size_t * kernAssignments,
+    int blockSize,
+    int numBlocks,
+    cudaStream_t stream
+);
+
 template void runGetScores<7, float>(
     const db_offset_t *sIndexes,
     const float *sData,
@@ -561,6 +1098,40 @@ template void runGetScores<7, float>(
     const float *tData,
     const std::size_t * tAssignments,
     const std::size_t tNumSig,
+    const float alpha,
+    const std::size_t maxSignatureSize,
+    float *sScores,
+    int blockSize,
+    int numBlocks,
+    cudaStream_t stream
+);
+
+template void runGetScoresPreprocessedLarge<7, float>(
+    const db_offset_t *indexes,
+    const float *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t sourceStartIndex,
+    const std::size_t numSources,
+    const std::size_t targetStartIndex,
+    const std::size_t numTargets,
+    const float alpha,
+    const std::size_t maxSignatureSize,
+    float *sScores,
+    int blockSize,
+    int sourceBlocks,
+    int targetBlocks,
+    cudaStream_t stream
+);
+
+template void runGetScoresPreprocessedSmall<7, float>(
+    const db_offset_t *indexes,
+    const float *data,
+    const std::size_t *assignment,
+    const std::size_t *clusterList,
+    const std::size_t *clusterListIndex,
+    const std::size_t startIndex,
+    const std::size_t numSources,
     const float alpha,
     const std::size_t maxSignatureSize,
     float *sScores,

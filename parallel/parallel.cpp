@@ -13,17 +13,8 @@
 
 #include <mpi.h>
 
-#include "work.hpp"
-
-void generateRandomPermutation(std::vector<std::size_t> &res, std::size_t count, std::size_t seed) {
-	res.resize(count);
-	for (std::size_t i = 0; i < count; ++i) {
-		res[i] = i;
-	}
-
-	std::mt19937 gen((unsigned int)seed);
-	std::shuffle(res.begin(), res.end(), gen);
-}
+#include "consAlg.hpp"
+#include "memAlg.hpp"
 
 void printResultStats(const KMedoidsResults& results)
 {
@@ -48,15 +39,21 @@ void printResultStats(const KMedoidsResults& results)
 template<int DIM, typename FLOAT = float>
 void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 {
+	static_assert(!std::is_same_v<FLOAT, float> || !std::is_same_v<FLOAT, double>, "Invalid FLOAT type");
+
 	using db_t = DBSignatureListMapped<DIM, FLOAT>;
 
 	FLOAT alpha = (FLOAT)args.getArgFloat("alpha").getValue();
 	std::size_t k = (std::size_t)args.getArgInt("k").getValue();
 	std::size_t maxIters = (std::size_t)args.getArgInt("iterations").getValue();
 	std::size_t seed = (std::size_t)args.getArgInt("seed").getValue();
-	std::size_t blockSize = (std::size_t)args.getArgInt("blockSize").getValue();
-	std::size_t sigPerBlock = (std::size_t)args.getArgInt("sigPerBlock").getValue();
-	std::size_t blocksPerKernel = (std::size_t)args.getArgInt("blocksPerKernel").getValue();
+	std::size_t asgnBlockSize = (std::size_t)args.getArgInt("asgnBlockSize").getValue();
+	std::size_t asgnSigPerBlock = (std::size_t)args.getArgInt("asgnSigPerBlock").getValue();
+	std::size_t asgnBlocksPerKernel = (std::size_t)args.getArgInt("asgnBlocksPerKernel").getValue();
+	std::size_t scoreSourcesPerBlock = (std::size_t)args.getArgInt("scoreSourcesPerBlock").getValue();
+	std::size_t scoreTargetsPerBlock = (std::size_t)args.getArgInt("scoreTargetsPerBlock").getValue();
+	std::size_t scoreSourceBlocksPerKernel = (std::size_t)args.getArgInt("scoreSourceBlocksPerKernel").getValue();
+	std::size_t scoreTargetBlocksPerKernel = (std::size_t)args.getArgInt("scoreTargetBlocksPerKernel").getValue();
 	std::size_t streams = (std::size_t)args.getArgInt("cudaStreams").getValue();
 
 	std::cout << "Opening database file " << args[0] << " ... ";
@@ -73,20 +70,34 @@ void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 	std::cout << "Initializing k-medoids (k = " << k << ", alpha = " << alpha << ", iterations limit = " << maxIters << ") ..." << std::endl;
 	KMedoidsResults results;
 
-	if (rank == 0) {
-		generateRandomPermutation(results.mMedoids, limit, seed);
+	// TODO: Other algs
+	MemCudaAlg<DIM, FLOAT> alg(
+		rank,
+		comm_size,
+		limit,
+		seed,
+		db,
+		alpha,
+		k,
+		asgnBlockSize,
+		asgnSigPerBlock,
+		asgnBlocksPerKernel,
+		scoreSourcesPerBlock,
+		scoreTargetsPerBlock,
+		scoreSourceBlocksPerKernel,
+		scoreTargetBlocksPerKernel,
+		streams
+	);
+
+	alg.initialize();
+
+	for (std::size_t iter = 0; iter < maxIters; ++iter) {
+		if (!alg.runIteration()) {
+			break;
+		}
 	}
 
-	results.mMedoids.resize(k);
-
-	// DEBUG
-	std::sort(results.mMedoids.begin(), results.mMedoids.end());
-	// END DEBUG
-	// Broadcast the initial medoids
-	MPICH(MPI_Bcast(results.mMedoids.data(), k, MPI_UINT64_T, 0, MPI_COMM_WORLD));
-
-	work(rank, comm_size, alpha, k, maxIters, limit, blockSize, sigPerBlock, blocksPerKernel, streams, db, results);
-
+	alg.fillResults(results);
 
 	//std::cout << "Computed avg. distance: " << kMedoids.getLastAvgDistance() << std::endl;
 	//std::cout << "Computed avg. in-cluster distance: " << kMedoids.getLastAvgClusterDistance() << std::endl;
@@ -127,10 +138,14 @@ int main(int argc, char* argv[])
 		args.registerArg<bpp::ProgramArguments::ArgInt>("images", "Limit for number of images (only first N images from the input file are taken)", false, 1024, 0);
 		args.registerArg<bpp::ProgramArguments::ArgFloat>("alpha", "Alpha tuning parameter for SQFD", false, 0.2, 0.0001, 100);
 
-		args.registerArg<bpp::ProgramArguments::ArgInt>("blockSize", "Number of threads in CUDA block", false, 256, 128, 1024);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlockSize", "Number of threads in CUDA block when computing assignment", false, 256, 128, 1024);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnSigPerBlock", "Number of signatures processed by a single block during assignment computation, must fit into shared memory", false, 10, 1, 64);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlocksPerKernel", "Number of blocks per kernel during assignment computation, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
 		// TODO: Calculate max number of signatures
-		args.registerArg<bpp::ProgramArguments::ArgInt>("sigPerBlock", "Number of signatures processed by a single block, must fit into shared memory", false, 10, 1, 64);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("blocksPerKernel", "Number of blocks per kernel, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourcesPerBlock", "Number of source signatures processed by a single block during score computation, must fit into shared memory", false, 10, 1, 64);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetsPerBlock", "Number of target signatures processed by a single block during score computation, determines how many blocks will be computing a single source block in parallel", false, 128, 1, 64);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourceBlocksPerKernel", "Number of blocks in the source signature dimension per kernel during score computation, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetBlocksPerKernel", "Number of blocks in the target signature dimension per kernel during score computation, largely determines global memory access pressure", false, 128, 1, 65535);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("cudaStreams", "Number of cuda streams, determines maximum parallelism in GPU.", false, 4, 1);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("seed", "Seed for random generator (to make results deterministic)", false, 42);
 
