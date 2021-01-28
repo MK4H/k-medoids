@@ -55,7 +55,7 @@ public:
             // 1 for each cluster + 2 * numRanks to account for
             // clusters spanning rank boundaries
             allFragments(numClusters + 2*numRanks),
-            asgnProps(rank, numRanks, inputData.dataSize(), asgnSigPerBlock, asgnBlocksPerKernel, this->sharedMemSize, inputData.getMaxSignatureLength(), asgnBlockSize),
+            asgnProps(rank, numRanks, inputData.size(), asgnSigPerBlock, asgnBlocksPerKernel, this->sharedMemSize, inputData.getMaxSignatureLength(), asgnBlockSize),
             scoreProps(scoreSourcesPerBlock, scoreTargetsPerBlock, scoreSourceBlocksPerKernel, scoreTargetBlocksPerKernel)
     {
         CUCH(cudaHostAlloc(&this->hMeds, numClusters * sizeof(std::size_t), cudaHostAllocPortable));
@@ -71,16 +71,44 @@ public:
         CUCH(cudaHostAlloc(&this->hClusterList, inputData.size() * sizeof(std::size_t), cudaHostAllocPortable));
         CUCH(cudaMalloc(&this->dClusterList, inputData.size() * sizeof(std::size_t)));
 
-        CUCH(cudaHostAlloc(&this->hClusterListIndex, (numClusters + 1) * sizeof(std::size_t), cudaHostAllocPortable));
-        CUCH(cudaMalloc(&this->dClusterList, (numClusters + 1) * sizeof(std::size_t)));
+        // Need +2 as we need +1 for the starting 0 and another +1 so that we can easily use it
+        // to fill clusterList, which will shift it one to the left
+        // Due to this, we will first start with two leading zeroes, where the second one will be removed
+        // by the shift left, making the index correct with one unused value at the end
+        CUCH(cudaHostAlloc(&this->hClusterListIndex, (numClusters + 2) * sizeof(std::size_t), cudaHostAllocPortable));
+        // On the device, we only need the leading zero, no shifting, so +1
+        CUCH(cudaMalloc(&this->dClusterListIndex, (numClusters + 1) * sizeof(std::size_t)));
 
+        // TODO: Try allocating as managed memory
+        // then just do a RAM copy, which the driver does anyway and let the CUDA runtime basically do overlapping for us
         CUCH(cudaMalloc(&this->dData, inputData.dataSize() * sizeof(FLOAT)));
         CUCH(cudaMalloc(&this->dIndexes, (inputData.size() + 1) * sizeof(db_offset_t)));
 
+        CUCH(cudaStreamCreate(&this->dataStream));
     }
 
     ~MemCudaAlg() override {
-        // TODO: Deallocate all memory allocated in constructor
+        CUCH(cudaStreamDestroy(this->dataStream));
+
+        CUCH(cudaFree(this->dIndexes));
+        CUCH(cudaFree(this->dData));
+
+        CUCH(cudaFree(this->dClusterListIndex));
+        CUCH(cudaFreeHost(this->hClusterListIndex));
+
+        CUCH(cudaFree(this->dClusterList));
+        CUCH(cudaFreeHost(this->hClusterList));
+
+        CUCH(cudaFree(this->dScores));
+        CUCH(cudaFreeHost(this->hScores));
+
+        CUCH(cudaFree(this->dAssignments));
+        CUCH(cudaFreeHost(this->hAssignments));
+
+        CUCH(cudaFree(this->dMeds));
+        CUCH(cudaFreeHost(this->hMedsOld));
+        CUCH(cudaFreeHost(this->hMeds));
+
     }
 
     void initialize() override {
@@ -112,9 +140,36 @@ public:
     }
 
     bool runIteration() override {
+
+        // std::cerr << std::endl << "--------Iteration start--------" << std::endl << std::endl;
+
         runAssignment(this->asgnProps);
 
+        // std::cout << "Assignments: " << std::endl;
+        // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
+        //     std::cout << this->hAssignments[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
         preprocessClusters();
+
+        // std::cout << "Cluster list index: " << std::endl;
+        // for (std::size_t i = 0; i < this->numClusters + 1; ++i) {
+        //     std::cout << this->hClusterListIndex[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        // std::cout << "Cluster complexities: " << std::endl;
+        // for (std::size_t i = 0; i < this->numClusters + 1; ++i) {
+        //     std::cout << this->clusterComplexities[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        // std::cout << "Cluster list: " << std::endl;
+        // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
+        //     std::cout << this->hClusterList[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
 
         return runScores(this->scoreProps);
     }
@@ -173,6 +228,7 @@ private:
 
         void reset() {
             next = 0;
+            mark = 0;
         }
     private:
         std::vector<cudaEvent_t> events;
@@ -183,12 +239,14 @@ private:
 
     struct AssignmentProperties {
         std::size_t blocksPerKernel;
-        std::size_t numKernels;
         std::size_t sigPerBlock;
+        std::size_t blockSize;
+
+        std::size_t numKernels;
         std::size_t sigPerKernel;
         std::size_t rankDataSize;
         std::size_t rankDataOffset;
-        std::size_t blockSize;
+
 
         std::vector<int> recvCounts;
         std::vector<int> displacements;
@@ -196,18 +254,18 @@ private:
         AssignmentProperties(
             int rank,
             int numRanks,
-            std::size_t inputDataSize,
+            std::size_t inputSize,
             std::size_t sigPerBlock,
             std::size_t blocksPerKernel,
             std::size_t sharedMemSize,
             std::size_t maxSignatureLength,
             std::size_t blockSize
-        ) : blocksPerKernel(blocksPerKernel)
+        ) : blocksPerKernel(blocksPerKernel), sigPerBlock(sigPerBlock), blockSize(blockSize)
         {
-            std::size_t normRankDataSize = (inputDataSize / numRanks) + (inputDataSize % numRanks != 0 ? 1 : 0);
+            std::size_t normRankDataSize = (inputSize / numRanks) + (inputSize % numRanks != 0 ? 1 : 0);
             this->rankDataOffset = rank * normRankDataSize;
 
-            std::size_t lastRankDataSize = inputDataSize - normRankDataSize * (numRanks - 1);
+            std::size_t lastRankDataSize = inputSize - normRankDataSize * (numRanks - 1);
             this->rankDataSize = rank != numRanks - 1 ? normRankDataSize : lastRankDataSize;
 
             auto maxSigPerBlock = std::max(
@@ -234,6 +292,26 @@ private:
                 this->displacements[i] = i * this->rankDataSize;
             }
         }
+
+        void print(std::ostream &out) {
+            out << "Sig per block: " << this->sigPerBlock << std::endl;
+            out << "Blocks per kernel: " << this->blocksPerKernel << std::endl;
+            out << "Block size: " << this->blockSize << std::endl;
+            out << "Num kernels: " << this->numKernels << std::endl;
+            out << "Sig per kernel: " << this->sigPerKernel << std::endl;
+            out << "Rank data size: " << this->rankDataSize << std::endl;
+            out << "Rank data offset: " << this->rankDataOffset << std::endl;
+            out << "Recv counts: [";
+            for (auto&& cnt: this->recvCounts) {
+                out << cnt << ", ";
+            }
+            out << "]" << std::endl;
+            out << "Displacements: [";
+            for (auto&& disp: this->displacements) {
+                out << disp << ", ";
+            }
+            out << "]" << std::endl;
+        }
     };
 
     struct ScoreProperties {
@@ -252,6 +330,13 @@ private:
             sourceBlocksPerKernel(sourceBlocksPerKernel),
             targetBlocksPerKernel(targetBlocksPerKernel) {
 
+        }
+
+        void print(std::ostream &out) {
+            out << "Sources per block: " << this->sourcesPerBlock << std::endl;
+            out << "Targets per block: " << this->targetsPerBlock << std::endl;
+            out << "Source blocks per kernel: " << this->sourceBlocksPerKernel << std::endl;
+            out << "Target blocks per kernel: " << this->targetBlocksPerKernel << std::endl;
         }
     };
 
@@ -314,6 +399,8 @@ private:
     std::vector<std::size_t> clusterComplexities;
 
     CudaEventPool eventPool;
+    // CUDA stream dedicated for background data transfer
+    cudaStream_t dataStream;
 
     // 1 for each rank
     std::vector<RankScoreSlice> rankScoreSlices;
@@ -370,36 +457,94 @@ private:
 
         CUCH(cudaDeviceSynchronize());
 
-        MPICH(MPI_Allgatherv(this->hAssignments + props.rankDataOffset, props.rankDataSize, this->assign_mpi_type, this->hAssignments, props.recvCounts.data(), props.displacements.data(), this->assign_mpi_type, MPI_COMM_WORLD));
+        MPICH(MPI_Allgatherv(MPI_IN_PLACE, props.rankDataSize, this->assign_mpi_type, this->hAssignments, props.recvCounts.data(), props.displacements.data(), this->assign_mpi_type, MPI_COMM_WORLD));
+        // Start assignment upload to GPU
+        CUCH(cudaMemcpyAsync(
+            this->dAssignments,
+            this->hAssignments,
+            this->inputData.size() * sizeof(std::size_t),
+            cudaMemcpyHostToDevice,
+            dataStream)
+        );
     }
 
     void preprocessClusters() {
-        // TODO: Parallelize this
-        for (std::size_t i = 0; i < this->inputData.size(); ++i) {
-            this->hClusterListIndex[this->hAssignments[i]]++;
+        // TODO: Make this faster
+        for (std::size_t i = 0; i < this->numClusters + 2; ++i) {
+            this->hClusterListIndex[i] = 0;
         }
 
-        for (std::size_t i = 0; i < this->numClusters; ++i) {
-            this->clusterComplexities[i] = this->hClusterListIndex[i] * this->hClusterListIndex[i];
+        // TODO: Parallelize this
+        for (std::size_t i = 0; i < this->inputData.size(); ++i) {
+            // +2 so that we can shift it left by one during clusterList filling
+            // and still have leading 0
+            this->hClusterListIndex[this->hAssignments[i] + 2]++;
         }
+
+        // std::cout << "Cluster list index: " << std::endl;
+        // for (std::size_t i = 0; i < this->numClusters + 2; ++i) {
+        //     std::cout << this->hClusterListIndex[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        // TODO: Parallelize this
+        for (std::size_t i = 1; i < this->numClusters + 1; ++i) {
+            // +1 due to the shift above
+            // clusterIndex is filled shifted one to the right so that we can then shift it
+            // one to the left during clusterList fillup
+            this->clusterComplexities[i] = this->hClusterListIndex[i + 1] * this->hClusterListIndex[i + 1];
+        }
+
+        // std::cout << "Cluster complexities: " << std::endl;
+        // for (std::size_t i = 0; i < this->numClusters + 1; ++i) {
+        //     std::cout << this->clusterComplexities[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
 
         // TODO: Parallelize this prefix sum
         this->hClusterListIndex[0] = 0;
+        this->hClusterListIndex[1] = 0;
         this->clusterComplexities[0] = 0;
         for (std::size_t i = 1; i < this->numClusters + 1; ++i) {
-            this->hClusterListIndex[i] = this->hClusterListIndex[i - 1] + this->hClusterListIndex[i];
+            // Again, clusterListIndex is shifted one to the right
+            this->hClusterListIndex[i + 1] = this->hClusterListIndex[i] + this->hClusterListIndex[i + 1];
             this->clusterComplexities[i] = this->clusterComplexities[i - 1] + this->clusterComplexities[i];
         }
 
         // TODO: Parallelize this
+        // This shifts the clusterListIndex one place to the left
         for (std::size_t i = 0; i < this->inputData.size(); ++i) {
             auto asgn = this->hAssignments[i];
-            auto idx = this->hClusterListIndex[asgn]++;
+            // Move the end of the cluster, i.e start of the next cluster
+            // We already had the start of the next cluster in asgn + 2,
+            // but that is being used to fill up the next cluster
+            auto idx = this->hClusterListIndex[asgn + 1]++;
             this->hClusterList[idx] = i;
         }
+
+        // Start cluster list and cluster list index uploads
+        CUCH(cudaMemcpyAsync(
+            this->dClusterListIndex,
+            this->hClusterListIndex,
+            (this->numClusters + 1) * sizeof(std::size_t),
+            cudaMemcpyHostToDevice,
+            dataStream)
+        );
+        CUCH(cudaMemcpyAsync(
+            this->dClusterList,
+            this->hClusterList,
+            this->inputData.size() * sizeof(std::size_t),
+            cudaMemcpyHostToDevice,
+            dataStream)
+        );
     }
 
     bool runScores(const ScoreProperties &props) {
+        // Wait for data uploads to finish
+        runZeroOut<FLOAT>(this->dScores, this->inputData.size(), 10, this->streams[0]);
+        CUCH(cudaDeviceSynchronize());
+        //CUCH(cudaStreamSynchronize(dataStream));
 
         this->eventPool.reset();
         std::size_t streamIdx = 0;
@@ -408,7 +553,13 @@ private:
         std::size_t complexityPerRank = totalComplexity / this->numRanks + (totalComplexity % this->numRanks != 0 ? 1 : 0);
         std::size_t startComplexity = complexityPerRank * this->rank;
         std::size_t endComplexity = std::min(complexityPerRank * (this->rank + 1), this->clusterComplexities.back());
-        std::size_t curCluster = std::binary_search(this->clusterComplexities.begin(), this->clusterComplexities.end(), startComplexity);
+        auto firstBigger = std::upper_bound(this->clusterComplexities.begin(), this->clusterComplexities.end(), startComplexity);
+        std::size_t curCluster = firstBigger - this->clusterComplexities.begin();
+        // Make it first smaller than startComplexity, so that we can check
+        // for partially processed big clusters and small clusters going accross rank boundaries
+        if (curCluster != 0) {
+            curCluster -= 1;
+        }
 
 
         std::size_t rankStartSource;
@@ -417,7 +568,7 @@ private:
         std::size_t rankEndCluster;
         // If the first cluster is big cluster, the previous rank
         // will have processed part of the cluster up to endComplexity
-        if (isBigCluster(clusterComplexities[curCluster])) {
+        if (isBigCluster(curCluster)) {
             // If the startComplexity is exactly the cluster start complexity,
             // start at the cluster beginning
             // This will always happen if cluster 0 is big
@@ -447,7 +598,7 @@ private:
         }
 
         while (this->clusterComplexities[curCluster] < endComplexity) {
-            if (isBigCluster(clusterComplexities[curCluster])) {
+            if (isBigCluster(curCluster)) {
                 // Will most definitely start processing at the start of the cluster
                 // May need to cut it off before the end
                 rankEndSource = getBigClusterEndSource(curCluster, clusterComplexities, endComplexity);
@@ -471,27 +622,75 @@ private:
             }
         }
 
-        this->rankScoreSlices[this->rank] = RankScoreSlice{rankStartCluster, rankEndCluster - rankStartCluster};
-        MPI_Request allGather;
-        // Exchange numbers of clusters processed by each rank
-        // Can be done while processing the cluster processing is running
-        MPICH(MPI_Iallgather(this->rankScoreSlices.data() + this->rank, 1, RankScoreSlice::MPI_Type, this->rankScoreSlices.data(), this->numRanks, RankScoreSlice::MPI_Type, MPI_COMM_WORLD, &allGather));
-
-        // Wait for all clusters processed by this rank to be finished
-        CUCH(cudaDeviceSynchronize());
-        computeRankFragments(rankStartSource, rankEndSource, rankStartSource, rankEndCluster);
-
-        MPICH(MPI_Wait(&allGather, MPI_STATUS_IGNORE));
-
-        // Wait for the exchange of data slices with other ranks to finish
+        // We are using Iallgatherv as Iallgather just did not work, don't know why
         std::vector<int> recvCounts(this->numRanks);
         std::vector<int> displacements(this->numRanks);
 
         for (std::size_t i = 0; i < this->numRanks; ++i) {
-            recvCounts[i] = this->rankScoreSlices[i].numClusters;
-            displacements[i] = displacements[i - 1] + recvCounts[i];
+            recvCounts[i] = 1;
         }
+        for (std::size_t i = 0; i < this->numRanks; ++i) {
+            displacements[i] = i;
+        }
+
+        this->rankScoreSlices[this->rank] = RankScoreSlice{rankStartCluster, rankEndCluster - rankStartCluster};
+        MPI_Request allGather;
+        // Exchange numbers of clusters processed by each rank
+        // Can be done while processing the cluster processing is running
+        // For some reason MPI_Iallgather did not work properly, it just transmited the contents of rank 0
+        MPICH(MPI_Iallgatherv(MPI_IN_PLACE, 1, RankScoreSlice::MPI_Type, this->rankScoreSlices.data(), recvCounts.data(), displacements.data(), RankScoreSlice::MPI_Type, MPI_COMM_WORLD, &allGather));
+
+        // Wait for all clusters processed by this rank to be finished
+        CUCH(cudaDeviceSynchronize());
+
+        // std::cout << "Rank start cluster: " << rankStartCluster << std::endl;
+        // std::cout << "Rank end cluster: " << rankEndCluster << std::endl;
+        // std::cout << "Rank start source: " << rankStartSource << std::endl;
+        // std::cout << "Rank end source: " << rankEndSource << std::endl;
+
+        // std::vector<FLOAT> orderedScores(this->inputData.size());
+        // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
+        //     orderedScores[this->hClusterList[i]] = this->hScores[i];
+        // }
+        // std::cout << "Scores: " << std::endl;
+        // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
+        //     std::cout << orderedScores[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        // std::cout << "Scores: " << std::endl;
+        // for (std::size_t i = this->hClusterListIndex[8]; i < this->hClusterListIndex[9]; ++i) {
+        //     std::cout << this->hScores[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        computeRankFragments(rankStartCluster, rankEndCluster, rankStartSource, rankEndSource);
+
+        MPICH(MPI_Wait(&allGather, MPI_STATUS_IGNORE));
+
+        // for (std::size_t rnk = 0; rnk < this->numRanks; ++rnk) {
+        //     std::cout << "Rank: " << rnk << std::endl;
+        //     std::cout << "Start cluster: " << this->rankScoreSlices[rnk].startCluster << std::endl;
+        //     std::cout << "Num clusters: " << this->rankScoreSlices[rnk].numClusters << std::endl;
+        //     std::cout << std::endl;
+        // }
+
+        for (std::size_t i = 0; i < this->numRanks; ++i) {
+            recvCounts[i] = this->rankScoreSlices[i].numClusters;
+        }
+        displacements[0] = 0;
+        for (std::size_t i = 1; i < this->numRanks; ++i) {
+            displacements[i] = displacements[i - 1] + recvCounts[i - 1];
+        }
+
+        // std::cout << "Displacements: [";
+        // for (auto&& disp: displacements) {
+        //     std::cout << disp << ", ";
+        // }
+        // std::cout << "]" << std::endl;
+
         MPICH(MPI_Allgatherv(this->rankFragments.data(), this->rankFragments.size(), MedFragment::MPI_Type, allFragments.data(), recvCounts.data(), displacements.data(), MedFragment::MPI_Type, MPI_COMM_WORLD));
+
 
         return computeMedoids(displacements);
     }
@@ -508,6 +707,10 @@ private:
         for (std::size_t cluster = 0; cluster < rankNumClusters; ++cluster) {
             std::size_t clusterStartSource = std::max(rankStartSource, this->hClusterListIndex[rankStartCluster + cluster]);
             std::size_t clusterEndSource = std::min(rankEndSource, this->hClusterListIndex[rankStartCluster + cluster + 1]);
+
+            // std::cout << "Cluster: " << rankStartCluster + cluster << std::endl;
+            // std::cout << "Cluster start source: " << clusterStartSource << std::endl;
+            // std::cout << "Cluster end source: " << clusterEndSource << std::endl;
 
             auto clusterStartScore = this->hScores + clusterStartSource;
             // TODO: Add execution policy
@@ -540,18 +743,21 @@ private:
         return false;
     }
 
-    bool isBigCluster(std::size_t clusterComplexity) {
-        // TODO: Make this a parameter
-        constexpr int clusterComplexityCutoff = 100;
+    std::size_t getClusterComplexity(std::size_t cluster) {
+        return this->clusterComplexities[cluster + 1] - this->clusterComplexities[cluster];
+    }
 
-        return clusterComplexity >= clusterComplexityCutoff;
+    bool isBigCluster(std::size_t cluster) {
+        // TODO: Make this a parameter
+        constexpr int clusterComplexityCutoff = 1000;
+
+        return getClusterComplexity(cluster) >= clusterComplexityCutoff;
     }
 
     std::size_t getBigClusterStartSource(std::size_t curCluster, const std::vector<std::size_t> &clusterComplexities, std::size_t startComplexity) {
         std::size_t clusterStart = this->hClusterListIndex[curCluster];
         std::size_t clusterEnd = this->hClusterListIndex[curCluster + 1];
         std::size_t clusterSize = clusterEnd - clusterStart;
-        std::size_t clusterComplexity = clusterComplexities[curCluster + 1] - clusterComplexities[curCluster];
 
         // [0,1] number telling us in which part of the big cluster to start
         // Because for every source we must process the whole size of the cluster
@@ -559,7 +765,7 @@ private:
         // This is to prevent multiple ranks computing partial scores for the same image
         // This will also allow us to just share results for the clusters we computed scores for
         // so another Allgatherv
-        double partToStartAt = (startComplexity - clusterComplexities[curCluster]) / clusterComplexity;
+        double partToStartAt = static_cast<double>(startComplexity - clusterComplexities[curCluster]) / getClusterComplexity(curCluster);
         return startComplexity == clusterComplexities[curCluster] ?
             clusterStart :
             clusterStart + partToStartAt * clusterSize;
@@ -569,8 +775,9 @@ private:
         std::size_t clusterStart = this->hClusterListIndex[curCluster];
         std::size_t clusterEnd = this->hClusterListIndex[curCluster + 1];
         std::size_t clusterSize = clusterEnd - clusterStart;
-        std::size_t clusterComplexity = clusterComplexities[curCluster + 1] - clusterComplexities[curCluster];
-        double partToEndAt = (endComplexity - clusterComplexities[curCluster]) / clusterComplexity;
+
+        double partToEndAt = static_cast<double>(endComplexity - clusterComplexities[curCluster]) / getClusterComplexity(curCluster);
+
         // WARNING: The rounding of partToEndAt * clusterSize MUST match with the rounding in getBigCLusterStartIndex
         //  otherwise we risk missing an item between endSource of rank i and startSource of rank i + 1
         return endComplexity >= clusterComplexities[curCluster + 1] ?
@@ -583,11 +790,27 @@ private:
     // So really big clusters can be shared between many many ranks
     // Then each rank will do a simple min of all clusters it worked on and send the minimum with it's score to all other clusters
     void processBigCluster(std::size_t sourcesStart, std::size_t sourcesEnd, std::size_t clusterStart, std::size_t clusterEnd, std::size_t sourcesPerBlock, std::size_t targetsPerBlock, std::size_t sourceBlocksPerKernel, std::size_t targetBlocksPerKernel, std::size_t &streamIdx) {
-        std::size_t blockSourcesStart = sourcesStart;
-        std::size_t blockSourcesEnd = std::min(blockSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, sourcesEnd);
-        std::size_t blockSourcesNum = blockSourcesEnd - blockSourcesStart;
-        while (blockSourcesStart < sourcesEnd) {
-            std::size_t sourceBlocks = blockSourcesNum / sourcesPerBlock + (blockSourcesNum % sourcesPerBlock != 0 ? 1 : 0);
+        std::size_t kernelSourcesStart = sourcesStart;
+        std::size_t kernelSourcesEnd = std::min(kernelSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, sourcesEnd);
+
+
+        // std::cerr << "BIG CLUSTER" << std::endl;
+        // std::cerr << "Sources start: " << sourcesStart << std::endl;
+        // std::cerr << "Sources end: " << sourcesEnd << std::endl;
+        // std::cerr << "Cluster start: " << clusterStart << std::endl;
+        // std::cerr << "Cluster end: " << clusterEnd << std::endl;
+        // std::cerr << std::endl;
+
+
+        while (kernelSourcesStart < sourcesEnd) {
+            std::size_t kernelSourcesNum = kernelSourcesEnd - kernelSourcesStart;
+            std::size_t sourceBlocks = kernelSourcesNum / sourcesPerBlock + (kernelSourcesNum % sourcesPerBlock != 0 ? 1 : 0);
+
+            // std::cerr << "Kernel sources start: " << kernelSourcesStart << std::endl;
+            // std::cerr << "Kernel sources end: " << kernelSourcesEnd << std::endl;
+            // std::cerr << "Source blocks: " << sourceBlocks << std::endl;
+            // std::cerr << "Stream Idx: " << streamIdx << std::endl;
+            // std::cerr << std::endl;
 
             this->eventPool.setMark();
 
@@ -595,15 +818,15 @@ private:
             std::size_t targetsEnd = std::min(clusterStart + targetsPerBlock * targetBlocksPerKernel, clusterEnd);
             std::size_t targetsNum = targetsEnd - targetsStart;
             while (targetsStart < clusterEnd) {
-                streamIdx += 1;
+                streamIdx = (streamIdx + 1) % this->streams.size();
                 std::size_t targetBlocks = targetsNum / targetsPerBlock + (targetsNum % targetsPerBlock != 0 ? 1 : 0);
                 runGetScoresPreprocessedLarge<DIM, FLOAT>(
                     this->dIndexes,
                     this->dData,
                     this->dAssignments,
                     this->dClusterList,
-                    blockSourcesStart,
-                    blockSourcesNum,
+                    kernelSourcesStart,
+                    kernelSourcesNum,
                     targetsStart,
                     targetsNum,
                     this->alpha,
@@ -624,9 +847,9 @@ private:
             for (auto it = this->eventPool.getMarkBegin(); it != this->eventPool.getMarkEnd(); ++it) {
                 CUCH(cudaStreamWaitEvent(this->streams[streamIdx], *it));
             }
-            CUCH(cudaMemcpyAsync(this->hScores + blockSourcesStart, this->dScores + blockSourcesStart, blockSourcesNum * sizeof(FLOAT), cudaMemcpyDeviceToHost, this->streams[streamIdx]));
-            blockSourcesStart = blockSourcesEnd;
-            blockSourcesEnd = std::min(blockSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, clusterEnd);
+            CUCH(cudaMemcpyAsync(this->hScores + kernelSourcesStart, this->dScores + kernelSourcesStart, kernelSourcesNum * sizeof(FLOAT), cudaMemcpyDeviceToHost, this->streams[streamIdx]));
+            kernelSourcesStart = kernelSourcesEnd;
+            kernelSourcesEnd = std::min(kernelSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, sourcesEnd);
         };
     }
 
@@ -634,18 +857,31 @@ private:
         // The first big cluster after the small cluster range
         std::size_t endCluster = firstCluster + 1;
 
+        // std::cerr << "SMALL CLUSTER" << std::endl;
+        // std::cerr << "First cluster: " << firstCluster << std::endl;
+        // std::cerr << "First cluster complexity: " << getClusterComplexity(firstCluster) << std::endl;
+        // std::cerr << "End complexity: " << endComplexity << std::endl;
+        // std::cerr << std::endl;
+
         // Add clusters to range while they are big
-        std::size_t curComplexity = clusterComplexities[firstCluster];
-        while (!isBigCluster(clusterComplexities[endCluster]) && clusterComplexities[endCluster] < endComplexity) {
+        while (!isBigCluster(endCluster) && clusterComplexities[endCluster] < endComplexity) {
+
+            // std::cerr << "Additional cluster complexity: " << getClusterComplexity(endCluster) << std::endl;
             endCluster += 1;
         }
 
-        std::size_t rangeStartIndex = this->hClusterListIndex[firstCluster];
-        std::size_t startIndex = rangeStartIndex;
+        std::size_t startIndex = this->hClusterListIndex[firstCluster];
         std::size_t leftToProcess = this->hClusterListIndex[endCluster] - startIndex;
         while (leftToProcess != 0) {
-            streamIdx += 1;
+            streamIdx = (streamIdx + 1) % this->streams.size();
             std::size_t kernelSources = std::min(sourcesPerBlock * blocksPerKernel, leftToProcess);
+            std::size_t numBlocks = kernelSources / sourcesPerBlock + (kernelSources % sourcesPerBlock != 0 ? 1 : 0);
+
+            // std::cerr << "Start index: " << startIndex << std::endl;
+            // std::cerr << "Kernel sources: " << kernelSources << std::endl;
+            // std::cerr << "Num blocks: " << numBlocks << std::endl;
+            // std::cerr << "Stream Idx: " << streamIdx << std::endl;
+
             runGetScoresPreprocessedSmall<DIM, FLOAT>(
                 this->dIndexes,
                 this->dData,
@@ -658,7 +894,7 @@ private:
                 this->inputData.getMaxSignatureLength(),
                 this->dScores,
                 this->blockSize,
-                blocksPerKernel,
+                numBlocks,
                 this->streams[streamIdx]
             );
             CUCH(cudaMemcpyAsync(this->hScores + startIndex, this->dScores + startIndex, kernelSources * sizeof(FLOAT), cudaMemcpyDeviceToHost, this->streams[streamIdx]));

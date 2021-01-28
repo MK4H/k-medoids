@@ -183,8 +183,26 @@ __device__ std::size_t copySigData(const db_offset_t *inIdx, const FLOAT *inAllD
         outData[i] = inAllData[startOffset + i];
     }
 
-    // Return size of the copied data
-    return endOffset - startOffset;
+    // Return number of copied centroids
+    return inIdx[numSig] - inIdx[0];
+}
+
+/**
+ * Copy non-continuous signatures from data to continuous memory in outData.
+ * Also creates outIndexes to access the outData.
+ */
+template<int DIM, typename FLOAT = float>
+__device__ void consolidateSigData(const db_offset_t *indexes, const FLOAT *data, const std::size_t *clusterList, std::size_t startIndex, std::size_t num, db_offset_t *outIndexes, FLOAT *outData) {
+
+    outIndexes[0] = 0;
+    for (int i = 0; i < num; ++i) {
+        auto sigId = clusterList[startIndex + i];
+        auto cpCentroids = copySigData<DIM, FLOAT>(indexes + sigId, data, 1, 0, outData);
+        outData += cpCentroids * (DIM + 1);
+        if (threadIdx.x == 0) {
+            outIndexes[i + 1] = outIndexes[i] + cpCentroids;
+        }
+    }
 }
 
 /**
@@ -686,21 +704,22 @@ __global__ void getScoresPreprocessedLarge(
 
     int blockStartSource = sourceStartIndex + blockIdx.x * sourcesPerBlock;
     int blockEndSource = min(blockStartSource + sourcesPerBlock, (int)(sourceStartIndex + numSources));
-    int blockNumSource = blockEndSource - blockStartSource;
 
-    // Copy non-continuous signatures belonging to the same cluster into continuous shared memory
-    auto cshData = shData;
-    shIndexes[0] = 0;
-    for (int i = 0; i < blockNumSource; ++i) {
-        auto sigId = clusterList[sourceStartIndex + i];
-        auto cpSize = copySigData<DIM, FLOAT>(indexes + sigId, data, 1, 0, shData);
-        cshData += cpSize;
-        if (threadIdx.x == 0) {
-            shIndexes[i + 1] = shIndexes[i] + cpSize;
-        }
+    if (blockStartSource >= blockEndSource) {
+        return;
     }
 
+    int blockNumSource = blockEndSource - blockStartSource;
+
+
+    for (int i = threadIdx.x; i < sourcesPerBlock; i += blockDim.x) {
+        shScores[i] = 0;
+    }
+
+    consolidateSigData<DIM, FLOAT>(indexes, data, clusterList, blockStartSource, blockNumSource, shIndexes, shData);
+
     __syncthreads();
+
     for (unsigned int i = 0; i < blockNumSource; ++i) {
         normalizeWeights<DIM, FLOAT, true>(Signature<DIM, FLOAT>(shIndexes[i], shIndexes[i + 1], shData), shSums);
     }
@@ -738,8 +757,10 @@ __global__ void getScoresPreprocessedLarge(
         }
     }
 
+    __syncthreads();
     for (unsigned int s = threadIdx.x; s < blockNumSource; s += blockDim.x) {
-        atomicAdd(sScores + sourceStartIndex + s, shScores[s]);
+        atomicAdd(sScores + blockStartSource + s, shScores[s]);
+        //atomicAdd(sScores + blockStartSource + s, 1);
     }
 }
 
@@ -803,27 +824,23 @@ __global__ void getScoresPreprocessedSmall(
     shSelfSims = shSums + blockDim.x;
     shScores = shSelfSims + sourcesPerBlock;
 
+    // TODO: These ints may be a problem for very large datasets
+    int blockStartSource = startIndex + blockIdx.x * sourcesPerBlock;
+    int blockEndSource = min(blockStartSource + sourcesPerBlock, (int)(startIndex + numSources));
+
+    if (blockStartSource >= blockEndSource) {
+        return;
+    }
+
+    int blockNumSource = blockEndSource - blockStartSource;
+
+
     // Initialize scores
     for (int i = threadIdx.x; i < sourcesPerBlock; i += blockDim.x) {
         shScores[i] = 0;
     }
 
-    // TODO: These ints may be a problem for very large datasets
-    int blockStartSource = startIndex + blockIdx.x * sourcesPerBlock;
-    int blockEndSource = min(blockStartSource + sourcesPerBlock, (int)(startIndex + numSources));
-    int blockNumSource = blockEndSource - blockStartSource;
-
-    // Copy non-continuous signatures belonging to the same cluster into continuous shared memory
-    auto cshData = shData;
-    shIndexes[0] = 0;
-    for (int i = 0; i < blockNumSource; ++i) {
-        auto sigId = clusterList[blockStartSource + i];
-        auto cpSize = copySigData<DIM, FLOAT>(indexes + sigId, data, 1, 0, shData);
-        cshData += cpSize;
-        if (threadIdx.x == 0) {
-            shIndexes[i + 1] = shIndexes[i] + cpSize;
-        }
-    }
+    consolidateSigData<DIM, FLOAT>(indexes, data, clusterList, blockStartSource, blockNumSource, shIndexes, shData);
 
     __syncthreads();
     for (unsigned int i = 0; i < blockNumSource; ++i) {
@@ -840,11 +857,16 @@ __global__ void getScoresPreprocessedSmall(
     auto curCluster = assignment[clusterList[blockStartSource]];
     auto curClusterStart = clusterListIndex[curCluster];
     auto curClusterEnd = clusterListIndex[curCluster + 1];
-    auto lastClusterEnd = clusterListIndex[assignment[blockEndSource] + 1];
+    // BlockEndSource is the first image after the last processed source image
+    // So -1 is the last processed image, and its cluster + 1 is the first cluster
+    // after the clusters spanned by this blocks sources
+    auto lastClusterEnd = clusterListIndex[assignment[clusterList[blockEndSource - 1]] + 1];
 
     auto sourceStart = 0;
-    auto sourceEnd = min((int)(curClusterEnd - blockStartSource), blockNumSource);
+    // Process either blockNumSource if all sources of this block are from the same cluster
+    auto sourceEnd = min(blockNumSource, (int)(curClusterEnd - blockStartSource));
     for (unsigned int t = curClusterStart; t < lastClusterEnd; ++t) {
+
         const db_offset_t *tIndex = indexes + clusterList[t];
         copySigData<DIM, FLOAT>(tIndex, data, 1, 0, shtData);
         auto tSig = Signature<DIM, FLOAT>(0, *(tIndex + 1) - *tIndex, shtData);
@@ -865,15 +887,16 @@ __global__ void getScoresPreprocessedSmall(
             }
         }
 
-        if (t == curClusterEnd) {
+        if (t == curClusterEnd - 1) {
             sourceStart = sourceEnd;
             curCluster += 1;
             curClusterEnd = clusterListIndex[curCluster + 1];
-            sourceEnd = min((int)(curClusterEnd - blockStartSource), blockNumSource);
+            sourceEnd = min(blockNumSource, (int)(curClusterEnd - blockStartSource));
         }
     }
 
-    for (unsigned int s = 0; s < blockNumSource; ++s) {
+    __syncthreads();
+    for (unsigned int s = threadIdx.x; s < blockNumSource; s += blockDim.x) {
         // This function expects that it is the only one
         // computing score for each of the source signatures it processes
         // as these are only small clusters which don't need to be split
