@@ -22,6 +22,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+// TODO: Just test
+#include "system/stopwatch.hpp"
+
 template<int DIM, typename FLOAT = float>
 class MemCudaAlg : public CudaAlg<DIM, FLOAT>
 {
@@ -38,10 +41,12 @@ public:
         std::size_t asgnBlockSize,
         std::size_t asgnSigPerBlock,
         std::size_t asgnBlocksPerKernel,
+        std::size_t scoreBlockSize,
         std::size_t scoreSourcesPerBlock,
         std::size_t scoreTargetsPerBlock,
         std::size_t scoreSourceBlocksPerKernel,
         std::size_t scoreTargetBlocksPerKernel,
+        std::size_t smallClusterComplexity,
         std::size_t cudaStreams
     )
         :   CudaAlg<DIM, FLOAT>(rank, numRanks, limit, seed, inputData, alpha, numClusters, asgnBlockSize, asgnSigPerBlock, asgnBlocksPerKernel, cudaStreams),
@@ -56,7 +61,7 @@ public:
             // clusters spanning rank boundaries
             allFragments(numClusters + 2*numRanks),
             asgnProps(rank, numRanks, inputData.size(), asgnSigPerBlock, asgnBlocksPerKernel, this->sharedMemSize, inputData.getMaxSignatureLength(), asgnBlockSize),
-            scoreProps(scoreSourcesPerBlock, scoreTargetsPerBlock, scoreSourceBlocksPerKernel, scoreTargetBlocksPerKernel)
+            scoreProps(scoreBlockSize, scoreSourcesPerBlock, scoreTargetsPerBlock, scoreSourceBlocksPerKernel, scoreTargetBlocksPerKernel, smallClusterComplexity)
     {
         CUCH(cudaHostAlloc(&this->hMeds, numClusters * sizeof(std::size_t), cudaHostAllocPortable));
         CUCH(cudaHostAlloc(&this->hMedsOld, numClusters * sizeof(std::size_t), cudaHostAllocPortable));
@@ -112,6 +117,7 @@ public:
     }
 
     void initialize() override {
+        bpp::Stopwatch stopwatch(true);
         CUCH(cudaMemcpyAsync(this->dData, this->inputData.data(), this->inputData.dataSize() * sizeof(FLOAT), cudaMemcpyHostToDevice));
 
         // Set the leading 0
@@ -137,13 +143,26 @@ public:
 
         MPICH(MPI_Wait(&bcast, MPI_STATUS_IGNORE));
         CUCH(cudaDeviceSynchronize());
+
+        stopwatch.stop();
+        std::cout << "Initialization time: " << stopwatch.getSeconds() << " seconds" << std::endl;
     }
 
     bool runIteration() override {
 
-        // std::cerr << std::endl << "--------Iteration start--------" << std::endl << std::endl;
+        // static int iter = 1;
+        // std::cerr << "Iteration " << iter++ << " medoids: " << std::endl;
+        // for (std::size_t i = 0; i < this->numClusters; ++i) {
+        //     std::cerr << this->hMeds[i] << ", ";
+        // }
+        // std::cerr << std::endl;
 
+
+        // std::cerr << std::endl << "--------Iteration start--------" << std::endl << std::endl;
+	    bpp::Stopwatch stopwatch(true);
         runAssignment(this->asgnProps);
+	    stopwatch.stop();
+        std::cout << "Assignment time: " << stopwatch.getSeconds() << " seconds" << std::endl;
 
         // std::cout << "Assignments: " << std::endl;
         // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
@@ -151,7 +170,10 @@ public:
         // }
         // std::cout << std::endl << std::endl;
 
+        stopwatch.start();
         preprocessClusters();
+        stopwatch.stop();
+        std::cout << "Preprocess time: " << stopwatch.getSeconds() << " seconds" << std::endl;
 
         // std::cout << "Cluster list index: " << std::endl;
         // for (std::size_t i = 0; i < this->numClusters + 1; ++i) {
@@ -171,7 +193,11 @@ public:
         // }
         // std::cout << std::endl << std::endl;
 
-        return runScores(this->scoreProps);
+        stopwatch.start();
+        bool cont = runScores(this->scoreProps);
+        stopwatch.stop();
+        std::cout << "Score time: " << stopwatch.getSeconds() << " seconds" << std::endl;
+        return cont;
     }
 
     void fillResults(KMedoidsResults &results) const override {
@@ -285,15 +311,15 @@ private:
             this->numKernels = numBlocks / this->blocksPerKernel + (numBlocks % this->blocksPerKernel != 0 ? 1 : 0);
             this->sigPerKernel = this->sigPerBlock * this->blocksPerKernel;
 
-            this->recvCounts = std::vector<int>(numRanks, this->rankDataSize);
+            this->recvCounts = std::vector<int>(numRanks, normRankDataSize);
             this->recvCounts.back() = lastRankDataSize;
             this->displacements.resize(numRanks);
             for (std::size_t i = 0; i < this->displacements.size(); ++i) {
-                this->displacements[i] = i * this->rankDataSize;
+                this->displacements[i] = i * normRankDataSize;
             }
         }
 
-        void print(std::ostream &out) {
+        void print(std::ostream &out) const {
             out << "Sig per block: " << this->sigPerBlock << std::endl;
             out << "Blocks per kernel: " << this->blocksPerKernel << std::endl;
             out << "Block size: " << this->blockSize << std::endl;
@@ -315,28 +341,36 @@ private:
     };
 
     struct ScoreProperties {
+        std::size_t blockSize;
         std::size_t sourcesPerBlock;
         std::size_t targetsPerBlock;
         std::size_t sourceBlocksPerKernel;
         std::size_t targetBlocksPerKernel;
+                std::size_t smallClusterComplexity;
 
         ScoreProperties(
+            std::size_t blockSize,
             std::size_t sourcesPerBlock,
             std::size_t targetsPerBlock,
             std::size_t sourceBlocksPerKernel,
-            std::size_t targetBlocksPerKernel
-        ) : sourcesPerBlock(sourcesPerBlock),
+            std::size_t targetBlocksPerKernel,
+            std::size_t smallClusterComplexity
+        ) : blockSize(blockSize),
+            sourcesPerBlock(sourcesPerBlock),
             targetsPerBlock(targetsPerBlock),
             sourceBlocksPerKernel(sourceBlocksPerKernel),
-            targetBlocksPerKernel(targetBlocksPerKernel) {
+            targetBlocksPerKernel(targetBlocksPerKernel),
+            smallClusterComplexity(smallClusterComplexity) {
 
         }
 
-        void print(std::ostream &out) {
+        void print(std::ostream &out) const {
+            out << "Block size: " << this->blockSize << std::endl;
             out << "Sources per block: " << this->sourcesPerBlock << std::endl;
             out << "Targets per block: " << this->targetsPerBlock << std::endl;
             out << "Source blocks per kernel: " << this->sourceBlocksPerKernel << std::endl;
             out << "Target blocks per kernel: " << this->targetBlocksPerKernel << std::endl;
+            out << "Small cluster complexity: " << this->smallClusterComplexity << std::endl;
         }
     };
 
@@ -457,6 +491,8 @@ private:
 
         CUCH(cudaDeviceSynchronize());
 
+        //props.print(std::cerr);
+
         MPICH(MPI_Allgatherv(MPI_IN_PLACE, props.rankDataSize, this->assign_mpi_type, this->hAssignments, props.recvCounts.data(), props.displacements.data(), this->assign_mpi_type, MPI_COMM_WORLD));
         // Start assignment upload to GPU
         CUCH(cudaMemcpyAsync(
@@ -568,14 +604,14 @@ private:
         std::size_t rankEndCluster;
         // If the first cluster is big cluster, the previous rank
         // will have processed part of the cluster up to endComplexity
-        if (isBigCluster(curCluster)) {
+        if (isBigCluster(curCluster, props)) {
             // If the startComplexity is exactly the cluster start complexity,
             // start at the cluster beginning
             // This will always happen if cluster 0 is big
             rankStartCluster = curCluster;
             rankStartSource = getBigClusterStartSource(curCluster, clusterComplexities, startComplexity);
             rankEndSource = getBigClusterEndSource(curCluster, clusterComplexities, endComplexity);
-            processBigCluster(rankStartSource, rankEndSource, this->hClusterListIndex[curCluster], this->hClusterListIndex[curCluster + 1], props.sourcesPerBlock, props.targetsPerBlock, props.sourceBlocksPerKernel, props.targetBlocksPerKernel, streamIdx);
+            processBigCluster(rankStartSource, rankEndSource, this->hClusterListIndex[curCluster], this->hClusterListIndex[curCluster + 1], props, streamIdx);
             curCluster++;
             rankEndCluster = curCluster;
         }
@@ -598,7 +634,7 @@ private:
         }
 
         while (this->clusterComplexities[curCluster] < endComplexity) {
-            if (isBigCluster(curCluster)) {
+            if (isBigCluster(curCluster, props)) {
                 // Will most definitely start processing at the start of the cluster
                 // May need to cut it off before the end
                 rankEndSource = getBigClusterEndSource(curCluster, clusterComplexities, endComplexity);
@@ -607,16 +643,13 @@ private:
                     rankEndSource,
                     this->hClusterListIndex[curCluster],
                     this->hClusterListIndex[curCluster + 1],
-                    props.sourcesPerBlock,
-                    props.targetsPerBlock,
-                    props.sourceBlocksPerKernel,
-                    props.targetBlocksPerKernel,
+                    props,
                     streamIdx);
                 curCluster++;
                 rankEndCluster = curCluster;
             }
             else {
-                curCluster += processSmallClusters(curCluster, clusterComplexities, endComplexity, props.sourcesPerBlock, props.sourceBlocksPerKernel, streamIdx);
+                curCluster += processSmallClusters(curCluster, clusterComplexities, endComplexity, props, streamIdx);
                 rankEndSource = this->hClusterListIndex[curCluster];
                 rankEndCluster = curCluster;
             }
@@ -633,6 +666,13 @@ private:
             displacements[i] = i;
         }
 
+        // std::cerr << "Rank score slices:" << std::endl;
+        // std::cerr << "Recvcounts: " << std::endl;
+        // print(std::cerr, recvCounts);
+        // std::cerr << "Displacements: " << std::endl;
+        // print(std::cerr, displacements);
+
+
         this->rankScoreSlices[this->rank] = RankScoreSlice{rankStartCluster, rankEndCluster - rankStartCluster};
         MPI_Request allGather;
         // Exchange numbers of clusters processed by each rank
@@ -647,6 +687,11 @@ private:
         // std::cout << "Rank end cluster: " << rankEndCluster << std::endl;
         // std::cout << "Rank start source: " << rankStartSource << std::endl;
         // std::cout << "Rank end source: " << rankEndSource << std::endl;
+        // std::cout << "Last cluster big: " << isBigCluster(rankEndCluster - 1, props) << std::endl;
+        // std::cout << "End cluster big: " << isBigCluster(rankEndCluster, props) << std::endl;
+        // std::cout << "Rank end complexity: " << endComplexity << std::endl;
+        // std::cout << "Last cluster complexity: " << this->clusterComplexities[rankEndCluster - 1] << std::endl;
+        // std::cout << "End cluster complexity: " << this->clusterComplexities[rankEndCluster] << std::endl;
 
         // std::vector<FLOAT> orderedScores(this->inputData.size());
         // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
@@ -659,7 +704,13 @@ private:
         // std::cout << std::endl << std::endl;
 
         // std::cout << "Scores: " << std::endl;
-        // for (std::size_t i = this->hClusterListIndex[8]; i < this->hClusterListIndex[9]; ++i) {
+        // for (std::size_t i = this->hClusterListIndex[4]; i < this->hClusterListIndex[5]; ++i) {
+        //     std::cout << this->hScores[i] << ", ";
+        // }
+        // std::cout << std::endl << std::endl;
+
+        // std::cout << "Scores: " << std::endl;
+        // for (std::size_t i = 0; i < this->inputData.size(); ++i) {
         //     std::cout << this->hScores[i] << ", ";
         // }
         // std::cout << std::endl << std::endl;
@@ -689,8 +740,22 @@ private:
         // }
         // std::cout << "]" << std::endl;
 
+        // std::cerr << "Rank fragments:" << std::endl;
+        // std::cerr << "Recvcounts: " << std::endl;
+        // print(std::cerr, recvCounts);
+        // std::cerr << "Displacements: " << std::endl;
+        // print(std::cerr, displacements);
+
         MPICH(MPI_Allgatherv(this->rankFragments.data(), this->rankFragments.size(), MedFragment::MPI_Type, allFragments.data(), recvCounts.data(), displacements.data(), MedFragment::MPI_Type, MPI_COMM_WORLD));
 
+        // for (std::size_t rank = 0; rank < this->numRanks; ++rank) {
+        //     std::cerr << "---------- Rank " << rank << " -----------" << std::endl;
+        //     for (std::size_t fragment = displacements[rank]; fragment < displacements[rank] + recvCounts[rank]; ++fragment) {
+        //         std::cerr << "Index: " << this->allFragments[fragment].idx << std::endl;
+        //         std::cerr << "Score: " << this->allFragments[fragment].score << std::endl;
+        //     }
+        //     std::cerr << std::endl;
+        // }
 
         return computeMedoids(displacements);
     }
@@ -708,14 +773,11 @@ private:
             std::size_t clusterStartSource = std::max(rankStartSource, this->hClusterListIndex[rankStartCluster + cluster]);
             std::size_t clusterEndSource = std::min(rankEndSource, this->hClusterListIndex[rankStartCluster + cluster + 1]);
 
-            // std::cout << "Cluster: " << rankStartCluster + cluster << std::endl;
-            // std::cout << "Cluster start source: " << clusterStartSource << std::endl;
-            // std::cout << "Cluster end source: " << clusterEndSource << std::endl;
-
             auto clusterStartScore = this->hScores + clusterStartSource;
             // TODO: Add execution policy
             auto min = std::min_element(clusterStartScore, this->hScores + clusterEndSource);
             this->rankFragments[cluster] = MedFragment{this->hClusterList[clusterStartSource + (min - clusterStartScore)], *min};
+
         }
     }
 
@@ -747,11 +809,8 @@ private:
         return this->clusterComplexities[cluster + 1] - this->clusterComplexities[cluster];
     }
 
-    bool isBigCluster(std::size_t cluster) {
-        // TODO: Make this a parameter
-        constexpr int clusterComplexityCutoff = 1000;
-
-        return getClusterComplexity(cluster) >= clusterComplexityCutoff;
+    bool isBigCluster(std::size_t cluster, const ScoreProperties &props) {
+        return getClusterComplexity(cluster) >= props.smallClusterComplexity;
     }
 
     std::size_t getBigClusterStartSource(std::size_t curCluster, const std::vector<std::size_t> &clusterComplexities, std::size_t startComplexity) {
@@ -768,7 +827,7 @@ private:
         double partToStartAt = static_cast<double>(startComplexity - clusterComplexities[curCluster]) / getClusterComplexity(curCluster);
         return startComplexity == clusterComplexities[curCluster] ?
             clusterStart :
-            clusterStart + partToStartAt * clusterSize;
+            std::max(static_cast<std::size_t>(std::floor(clusterStart + partToStartAt * clusterSize)), clusterStart);
     }
 
     std::size_t getBigClusterEndSource(std::size_t curCluster, const std::vector<std::size_t> &clusterComplexities, std::size_t endComplexity) {
@@ -778,20 +837,26 @@ private:
 
         double partToEndAt = static_cast<double>(endComplexity - clusterComplexities[curCluster]) / getClusterComplexity(curCluster);
 
+        // std::cout << "Part to end at: " << partToEndAt << std::endl;
+        // std::cout << "Cluster start: " << clusterStart << std::endl;
+        // std::cout << "End source: " << std::min(static_cast<std::size_t>(std::ceil(clusterStart + partToEndAt * clusterSize)), clusterEnd) << std::endl;
+        // std::cout << "Cluster end: " << clusterEnd << std::endl;
+
         // WARNING: The rounding of partToEndAt * clusterSize MUST match with the rounding in getBigCLusterStartIndex
         //  otherwise we risk missing an item between endSource of rank i and startSource of rank i + 1
+        //  or better they overlap, does not matter that we process one item at both ends, it will give the same results
         return endComplexity >= clusterComplexities[curCluster + 1] ?
             clusterEnd :
-            clusterStart + partToEndAt * clusterSize;
+            std::min(static_cast<std::size_t>(std::ceil(clusterStart + partToEndAt * clusterSize)), clusterEnd);
     }
 
     // TODO: Share big cluster processing between neighbouring nodes, to split up really large clusters
     // Leave each rank to process only so many source images to fill complexity per rank
     // So really big clusters can be shared between many many ranks
     // Then each rank will do a simple min of all clusters it worked on and send the minimum with it's score to all other clusters
-    void processBigCluster(std::size_t sourcesStart, std::size_t sourcesEnd, std::size_t clusterStart, std::size_t clusterEnd, std::size_t sourcesPerBlock, std::size_t targetsPerBlock, std::size_t sourceBlocksPerKernel, std::size_t targetBlocksPerKernel, std::size_t &streamIdx) {
+    void processBigCluster(std::size_t sourcesStart, std::size_t sourcesEnd, std::size_t clusterStart, std::size_t clusterEnd, const ScoreProperties &props, std::size_t &streamIdx) {
         std::size_t kernelSourcesStart = sourcesStart;
-        std::size_t kernelSourcesEnd = std::min(kernelSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, sourcesEnd);
+        std::size_t kernelSourcesEnd = std::min(kernelSourcesStart + props.sourcesPerBlock * props.sourceBlocksPerKernel, sourcesEnd);
 
 
         // std::cerr << "BIG CLUSTER" << std::endl;
@@ -804,7 +869,7 @@ private:
 
         while (kernelSourcesStart < sourcesEnd) {
             std::size_t kernelSourcesNum = kernelSourcesEnd - kernelSourcesStart;
-            std::size_t sourceBlocks = kernelSourcesNum / sourcesPerBlock + (kernelSourcesNum % sourcesPerBlock != 0 ? 1 : 0);
+            std::size_t sourceBlocks = kernelSourcesNum / props.sourcesPerBlock + (kernelSourcesNum % props.sourcesPerBlock != 0 ? 1 : 0);
 
             // std::cerr << "Kernel sources start: " << kernelSourcesStart << std::endl;
             // std::cerr << "Kernel sources end: " << kernelSourcesEnd << std::endl;
@@ -815,11 +880,11 @@ private:
             this->eventPool.setMark();
 
             std::size_t targetsStart = clusterStart;
-            std::size_t targetsEnd = std::min(clusterStart + targetsPerBlock * targetBlocksPerKernel, clusterEnd);
-            std::size_t targetsNum = targetsEnd - targetsStart;
+            std::size_t targetsEnd = std::min(clusterStart + props.targetsPerBlock * props.targetBlocksPerKernel, clusterEnd);
             while (targetsStart < clusterEnd) {
                 streamIdx = (streamIdx + 1) % this->streams.size();
-                std::size_t targetBlocks = targetsNum / targetsPerBlock + (targetsNum % targetsPerBlock != 0 ? 1 : 0);
+                std::size_t targetsNum = targetsEnd - targetsStart;
+                std::size_t targetBlocks = targetsNum / props.targetsPerBlock + (targetsNum % props.targetsPerBlock != 0 ? 1 : 0);
                 runGetScoresPreprocessedLarge<DIM, FLOAT>(
                     this->dIndexes,
                     this->dData,
@@ -832,7 +897,7 @@ private:
                     this->alpha,
                     this->inputData.getMaxSignatureLength(),
                     this->dScores,
-                    this->blockSize,
+                    props.blockSize,
                     sourceBlocks,
                     targetBlocks,
                     this->streams[streamIdx]
@@ -840,7 +905,7 @@ private:
                 CUCH(cudaEventRecord(this->eventPool.getEvent(), this->streams[streamIdx]));
 
                 targetsStart = targetsEnd;
-                targetsEnd = std::min(targetsStart + targetsPerBlock * targetBlocksPerKernel, clusterEnd);
+                targetsEnd = std::min(targetsStart + props.targetsPerBlock * props.targetBlocksPerKernel, clusterEnd);
             };
 
             // Wait for all kernels computing the current source range
@@ -849,11 +914,11 @@ private:
             }
             CUCH(cudaMemcpyAsync(this->hScores + kernelSourcesStart, this->dScores + kernelSourcesStart, kernelSourcesNum * sizeof(FLOAT), cudaMemcpyDeviceToHost, this->streams[streamIdx]));
             kernelSourcesStart = kernelSourcesEnd;
-            kernelSourcesEnd = std::min(kernelSourcesStart + sourcesPerBlock * sourceBlocksPerKernel, sourcesEnd);
+            kernelSourcesEnd = std::min(kernelSourcesStart + props.sourcesPerBlock * props.sourceBlocksPerKernel, sourcesEnd);
         };
     }
 
-    std::size_t processSmallClusters(std::size_t firstCluster, const std::vector<std::size_t> &clusterComplexities, std::size_t endComplexity, std::size_t sourcesPerBlock, std::size_t blocksPerKernel, std::size_t &streamIdx) {
+    std::size_t processSmallClusters(std::size_t firstCluster, const std::vector<std::size_t> &clusterComplexities, std::size_t endComplexity, const ScoreProperties &props, std::size_t &streamIdx) {
         // The first big cluster after the small cluster range
         std::size_t endCluster = firstCluster + 1;
 
@@ -864,7 +929,7 @@ private:
         // std::cerr << std::endl;
 
         // Add clusters to range while they are big
-        while (!isBigCluster(endCluster) && clusterComplexities[endCluster] < endComplexity) {
+        while (!isBigCluster(endCluster, props) && clusterComplexities[endCluster] < endComplexity) {
 
             // std::cerr << "Additional cluster complexity: " << getClusterComplexity(endCluster) << std::endl;
             endCluster += 1;
@@ -874,8 +939,8 @@ private:
         std::size_t leftToProcess = this->hClusterListIndex[endCluster] - startIndex;
         while (leftToProcess != 0) {
             streamIdx = (streamIdx + 1) % this->streams.size();
-            std::size_t kernelSources = std::min(sourcesPerBlock * blocksPerKernel, leftToProcess);
-            std::size_t numBlocks = kernelSources / sourcesPerBlock + (kernelSources % sourcesPerBlock != 0 ? 1 : 0);
+            std::size_t kernelSources = std::min(props.sourcesPerBlock * props.sourceBlocksPerKernel, leftToProcess);
+            std::size_t numBlocks = kernelSources / props.sourcesPerBlock + (kernelSources % props.sourcesPerBlock != 0 ? 1 : 0);
 
             // std::cerr << "Start index: " << startIndex << std::endl;
             // std::cerr << "Kernel sources: " << kernelSources << std::endl;
@@ -893,7 +958,7 @@ private:
                 this->alpha,
                 this->inputData.getMaxSignatureLength(),
                 this->dScores,
-                this->blockSize,
+                props.blockSize,
                 numBlocks,
                 this->streams[streamIdx]
             );

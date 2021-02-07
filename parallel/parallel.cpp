@@ -28,10 +28,10 @@ void printResultStats(const KMedoidsResults& results)
 	}
 	std::cout << std::endl << std::endl;
 
-	for (auto&& a : results.mAssignment) {
-		std::cout << a << ", ";
-	}
-	std::cout << std::endl << std::endl;
+	// for (auto&& a : results.mAssignment) {
+	// 	std::cout << a << ", ";
+	// }
+	// std::cout << std::endl << std::endl;
 }
 
 
@@ -50,10 +50,12 @@ void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 	std::size_t asgnBlockSize = (std::size_t)args.getArgInt("asgnBlockSize").getValue();
 	std::size_t asgnSigPerBlock = (std::size_t)args.getArgInt("asgnSigPerBlock").getValue();
 	std::size_t asgnBlocksPerKernel = (std::size_t)args.getArgInt("asgnBlocksPerKernel").getValue();
+	std::size_t scoreBlockSize = (std::size_t)args.getArgInt("scoreBlockSize").getValue();
 	std::size_t scoreSourcesPerBlock = (std::size_t)args.getArgInt("scoreSourcesPerBlock").getValue();
 	std::size_t scoreTargetsPerBlock = (std::size_t)args.getArgInt("scoreTargetsPerBlock").getValue();
 	std::size_t scoreSourceBlocksPerKernel = (std::size_t)args.getArgInt("scoreSourceBlocksPerKernel").getValue();
 	std::size_t scoreTargetBlocksPerKernel = (std::size_t)args.getArgInt("scoreTargetBlocksPerKernel").getValue();
+	std::size_t smallClusterComplexity = (std::size_t)args.getArgInt("smallClusterComplexity").getValue();
 	std::size_t streams = (std::size_t)args.getArgInt("cudaStreams").getValue();
 
 	std::cout << "Opening database file " << args[0] << " ... ";
@@ -82,10 +84,12 @@ void run(const bpp::ProgramArguments& args, int rank, int comm_size)
 		asgnBlockSize,
 		asgnSigPerBlock,
 		asgnBlocksPerKernel,
+		scoreBlockSize,
 		scoreSourcesPerBlock,
 		scoreTargetsPerBlock,
 		scoreSourceBlocksPerKernel,
 		scoreTargetBlocksPerKernel,
+		smallClusterComplexity,
 		streams
 	);
 
@@ -139,13 +143,15 @@ int main(int argc, char* argv[])
 		args.registerArg<bpp::ProgramArguments::ArgFloat>("alpha", "Alpha tuning parameter for SQFD", false, 0.2, 0.0001, 100);
 
 		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlockSize", "Number of threads in CUDA block when computing assignment", false, 256, 128, 1024);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnSigPerBlock", "Number of signatures processed by a single block during assignment computation, must fit into shared memory", false, 10, 1, 64);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlocksPerKernel", "Number of blocks per kernel during assignment computation, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnSigPerBlock", "Number of signatures processed by a single block during assignment computation, must fit into shared memory", false, 5, 1, 64);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlocksPerKernel", "Number of blocks per kernel during assignment computation, determines data transfer overlapping and kernel execution parallelism", false, 65535, 1, 65535);
 		// TODO: Calculate max number of signatures
-		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourcesPerBlock", "Number of source signatures processed by a single block during score computation, must fit into shared memory", false, 10, 1, 64);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetsPerBlock", "Number of target signatures processed by a single block during score computation, determines how many blocks will be computing a single source block in parallel", false, 128, 1, 64);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourceBlocksPerKernel", "Number of blocks in the source signature dimension per kernel during score computation, determines data transfer overlapping and kernel execution parallelism", false, 1024, 1, 65535);
-		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetBlocksPerKernel", "Number of blocks in the target signature dimension per kernel during score computation, largely determines global memory access pressure", false, 128, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreBlockSize", "Number of threads in CUDA block when computing scores", false, 256, 128, 1024);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourcesPerBlock", "Number of source signatures processed by a single block during score computation, must fit into shared memory", false, 5, 1, 64);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetsPerBlock", "Number of target signatures processed by a single block during score computation, determines how many blocks will be computing a single source block in parallel", false, 100, 1);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourceBlocksPerKernel", "Number of blocks in the source signature dimension per kernel during score computation, determines data transfer overlapping and kernel execution parallelism", false, 65535, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetBlocksPerKernel", "Number of blocks in the target signature dimension per kernel during score computation, largely determines global memory access pressure", false, 65535, 1, 65535);
+		args.registerArg<bpp::ProgramArguments::ArgInt>("smallClusterComplexity", "Complexity under which block is considered small. Complexity is size of the block squared.", false, 1000000, 100);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("cudaStreams", "Number of cuda streams, determines maximum parallelism in GPU.", false, 4, 1);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("seed", "Seed for random generator (to make results deterministic)", false, 42);
 
