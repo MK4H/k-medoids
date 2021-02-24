@@ -88,7 +88,7 @@ public:
         // On the device, we only need the leading zero, no shifting, so +1
         CUCH(cudaMalloc(&this->dClusterListIndex, (numClusters + 1) * sizeof(std::size_t)));
 
-        // TODO: Try allocating as managed memory
+        // ALT: Allocating as managed memory
         // then just do a RAM copy, which the driver does anyway and let the CUDA runtime basically do overlapping for us
         CUCH(cudaMalloc(&this->dData, inputData.dataSize() * sizeof(FLOAT)));
         CUCH(cudaMalloc(&this->dIndexes, (inputData.size() + 1) * sizeof(db_offset_t)));
@@ -663,7 +663,7 @@ private:
             std::size_t clusterEndSource = std::min(rankEndSource, this->hClusterListIndex[rankStartCluster + cluster + 1]);
 
             auto clusterStartScore = this->hScores + clusterStartSource;
-            // TODO: Add execution policy
+            // TODO: Add execution policy for parallelization
             auto min = std::min_element(clusterStartScore, this->hScores + clusterEndSource);
             this->rankFragments[cluster] = MedFragment{this->hClusterList[clusterStartSource + (min - clusterStartScore)], *min};
 

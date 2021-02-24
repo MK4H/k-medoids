@@ -137,7 +137,7 @@ template<int DIM, typename FLOAT = float>
 __device__ FLOAT getOtherSim(Signature<DIM, FLOAT> sig1, Signature<DIM, FLOAT> sig2, FLOAT alpha, FLOAT *partSums) {
     FLOAT sum = 0;
 
-    // TODO: While can be rewritten into a for cycle
+    // NOTE: We could probably rewrite the while into a for cycle
     int row = threadIdx.x / sig2.numCentroids;
     int col = threadIdx.x % sig2.numCentroids;
 
@@ -270,7 +270,7 @@ __device__ void partitionSharedMemAssign(
     // the following signature to allow us to calculate the size of the last signature
     med = (FLOAT *)(shAssignments + sigPerBlock);
     mins = med + maxSignatureSize * (DIM + 1);
-    // TODO: Use warp reduce and reduce the size of shSum to one element per warp
+
     // We need one sum entry for each thread
     shSums = mins + sigPerBlock;
     dSelfSims = shSums + blockDim.x;
