@@ -93,7 +93,7 @@ __device__ FLOAT mergeSums(FLOAT *partSums) {
     return total;
 }
 
-/** TODO: Use that the resulting matrix is symmetric
+/**
 * Computes the self similarity of a signature
 *
 * The computation is divided as follows:
@@ -112,10 +112,9 @@ template<int DIM, typename FLOAT = float>
 __device__ FLOAT getSelfSim(Signature<DIM, FLOAT> sig, FLOAT alpha, FLOAT *partSums) {
     FLOAT sum = 0;
 
-    // TODO: Can be rewritten into a for cycle
     int row = threadIdx.x / sig.numCentroids;
     int col = threadIdx.x % sig.numCentroids;
-
+    // TODO: Use that the matrix is symmetric
     while (row < sig.numCentroids) {
         sum += sig.weights[row] * similarity<DIM, FLOAT>(sig.centroids + row * DIM, sig.centroids + col * DIM, alpha) * sig.weights[col];
         col += blockDim.x;
@@ -127,9 +126,9 @@ __device__ FLOAT getSelfSim(Signature<DIM, FLOAT> sig, FLOAT alpha, FLOAT *partS
     return mergeSums(partSums);
 }
 
-/** TODO: Check that the result matrix really is symmetric
-* \brief Computes the top left and bottom right corner parts of the similarity metrix
-*       multiplied by weights
+/**
+* \brief Computes the top right and bottom left corner parts (which are the same, as the matrix is symmetric)
+*   of the similarity metrix multiplied by weights
 *
 * \note Results are added to the partSums array so that they are kept thread local, no synchronization needed
 *
@@ -760,7 +759,6 @@ __global__ void getScoresPreprocessedLarge(
     __syncthreads();
     for (unsigned int s = threadIdx.x; s < blockNumSource; s += blockDim.x) {
         atomicAdd(sScores + blockStartSource + s, shScores[s]);
-        //atomicAdd(sScores + blockStartSource + s, 1);
     }
 }
 

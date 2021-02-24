@@ -10,4 +10,4 @@ set -eu -o pipefail
 
 
 { time srun -p volta-hp --gpus-per-task=1 --cpus-per-task=16 --mem-per-gpu=64G --ntasks=11 \
-    ./parallel  /mnt/home/_teaching/advpara/final-kmedoids/data/aloi.bsf ; } > std.out 2> std.err
+    ./parallel /mnt/home/_teaching/advpara/final-kmedoids/data/aloi.bsf ; } > std.out 2> std.err

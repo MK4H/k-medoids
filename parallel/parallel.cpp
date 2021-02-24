@@ -145,7 +145,7 @@ int main(int argc, char* argv[])
 		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlockSize", "Number of threads in CUDA block when computing assignment", false, 256, 128, 1024);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnSigPerBlock", "Number of signatures processed by a single block during assignment computation, must fit into shared memory", false, 5, 1, 64);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("asgnBlocksPerKernel", "Number of blocks per kernel during assignment computation, determines data transfer overlapping and kernel execution parallelism", false, 65535, 1, 65535);
-		// TODO: Calculate max number of signatures
+
 		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreBlockSize", "Number of threads in CUDA block when computing scores", false, 256, 128, 1024);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreSourcesPerBlock", "Number of source signatures processed by a single block during score computation, must fit into shared memory", false, 5, 1, 64);
 		args.registerArg<bpp::ProgramArguments::ArgInt>("scoreTargetsPerBlock", "Number of target signatures processed by a single block during score computation, determines how many blocks will be computing a single source block in parallel", false, 100, 1);
